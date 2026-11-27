@@ -923,3 +923,123 @@ async fn abort_without_or_during_scheduler_retires_schedule_without_stopping_dae
     );
     rt.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cleanup_pending_merges_skewed_legs_and_reclaims_orphaned_slots() {
+    fn encode_slot_unit(owner: [u8; 32], expires_ms: u64) -> Bytes {
+        let mut raw = Vec::with_capacity(281);
+        raw.push(0x10);
+        raw.extend_from_slice(&1_u64.to_be_bytes());
+        raw.extend_from_slice(&owner);
+        raw.extend_from_slice(&expires_ms.to_be_bytes());
+        raw.push(0);
+        raw.extend_from_slice(&[0_u8; 24 + 192]);
+        Bytes::from(raw)
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let memory = MemoryBackend::new();
+    let rt = runtime(memory.clone());
+
+    let input = InputSnapshot::create(
+        &dir.path().join("source"),
+        config(Metric::L2, false),
+        1024 * 1024,
+        (0..6).map(|id| Ok(record(id))),
+    )
+    .unwrap();
+
+    // ID 1: orphaned schedule after index drop
+    let j1 = rt
+        .start_bulk_build("idx-1", &input, construction_options())
+        .await
+        .unwrap();
+    let id1 = j1.logical_index_id();
+    j1.schedule(worker_options(&dir)).await.unwrap();
+    {
+        let mut txn = memory.begin_write().await.unwrap();
+        txn.delete(Bytes::from(keys::manifest_key(id1)))
+            .await
+            .unwrap();
+        txn.delete(Bytes::from(keys::build_descriptor_key(id1)))
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    // IDs 2, 3, 4: workspaces left after drop_index
+    let mut ws_ids = Vec::new();
+    for n in 2..=4 {
+        let name = format!("idx-{n}");
+        let j = rt
+            .start_bulk_build(&name, &input, construction_options())
+            .await
+            .unwrap();
+        ws_ids.push(j.logical_index_id());
+        let mut o = worker_options(&dir);
+        o.memory_bytes = 8 * 1024;
+        j.run_worker(o).await.unwrap();
+        rt.drop_index(&name).await.unwrap();
+    }
+
+    // ID 5: orphaned expired `BuildScheduleSlot` with no `BuildWorkspace` or `BuildSchedule`
+    let id5 = LogicalIndexId::new(999).unwrap();
+    {
+        let mut txn = memory.begin_write().await.unwrap();
+        txn.put(
+            Bytes::from(keys::build_schedule_slot_key(id5, 0)),
+            encode_slot_unit([7_u8; 32], 1),
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    let mut total_reclaimed = 0;
+    let mut cursor = None;
+    loop {
+        let page = rt.cleanup_bulk_builds(2, cursor).await.unwrap();
+        total_reclaimed += page.reclaimed;
+        assert_eq!(page.pending, 0);
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(total_reclaimed, 5);
+    for check_id in [id1, ws_ids[0], ws_ids[1], ws_ids[2], id5] {
+        wait_empty(&memory, check_id).await;
+        let mut rtxn = ReadLogicalTxn::bootstrap(memory.begin_read().await.unwrap());
+        assert!(
+            rtxn.get(LogicalKey::BuildWorkspace(check_id))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // Also verify `schedule()` rejects with `BulkBuildBusy` when an active slot exists even for `distributed_workers == 1`.
+    let j6 = rt
+        .start_bulk_build("idx-6", &input, construction_options())
+        .await
+        .unwrap();
+    let id6 = j6.logical_index_id();
+    {
+        let mut txn = memory.begin_write().await.unwrap();
+        txn.put(
+            Bytes::from(keys::build_schedule_slot_key(id6, 1)),
+            encode_slot_unit([9_u8; 32], u64::MAX),
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+    }
+    let mut single_opts = worker_options(&dir);
+    single_opts.distributed_workers = 1;
+    assert_eq!(
+        j6.schedule(single_opts).await.unwrap_err().kind(),
+        ErrorKind::BulkBuildBusy
+    );
+    j6.abort().await.unwrap();
+    rt.shutdown().await.unwrap();
+}

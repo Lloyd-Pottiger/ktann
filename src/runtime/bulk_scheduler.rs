@@ -68,8 +68,10 @@ pub(crate) fn now_ms() -> Result<u64> {
 }
 
 pub(crate) fn expiry(delay: Duration) -> Result<u64> {
+    let delay_ms = u64::try_from(delay.as_nanos().div_ceil(1_000_000))
+        .map_err(|_| Error::invalid_argument())?;
     now_ms()?
-        .checked_add(u64::try_from(delay.as_millis()).map_err(|_| Error::invalid_argument())?)
+        .checked_add(delay_ms)
         .ok_or_else(Error::invalid_argument)
 }
 
@@ -285,7 +287,8 @@ async fn renew_authority_once<B: Backend>(
     lease: Duration,
     confirmed_expires_ms: &mut u64,
 ) -> Result<()> {
-    let _guard = tokio::time::timeout(Duration::from_millis(5), lease_lock.write())
+    let lock_wait = (lease / 6).clamp(Duration::from_millis(25), Duration::from_secs(2));
+    let _guard = tokio::time::timeout(lock_wait, lease_lock.write())
         .await
         .ok();
     let skey = authority.slot_key(id);
@@ -587,18 +590,11 @@ pub(crate) async fn enqueue<B: Backend>(
                 Some(_) => return Err(Error::invalid_argument()),
                 None => {}
             }
-            if options_ref.distributed_workers > 1 {
-                let (active, _) = inspect_peer_slots(
-                    &mut txn,
-                    id,
-                    options_ref.distributed_workers as u32,
-                    None,
-                    now_ms()?,
-                )
-                .await?;
-                if active > 0 {
-                    return Err(Error::new(ErrorKind::BulkBuildBusy));
-                }
+            let now = now_ms()?;
+            let check_slots = options_ref.distributed_workers.max(1) as u32;
+            let (active, _) = inspect_peer_slots(&mut txn, id, check_slots, None, now).await?;
+            if active > 0 || has_any_active_slot_in_write(&mut txn, id, now).await? {
+                return Err(Error::new(ErrorKind::BulkBuildBusy));
             }
             txn.put(
                 key,
@@ -789,6 +785,8 @@ async fn finish<B: Backend>(
     // still releases or retires this worker's `BuildScheduleSlot` lease cleanly.
     let finish_ctrl = OperationOptions::default()
         .with_deadline(std::time::Instant::now() + Duration::from_secs(2));
+    let attempted_slot_delete = std::sync::atomic::AtomicBool::new(false);
+    let attempted_ref = &attempted_slot_delete;
 
     bulk_worker::retry_raw_write(
         &finish_ctrl,
@@ -839,10 +837,11 @@ async fn finish<B: Backend>(
                 )
                 .await?;
                 let skey = auth.slot_key(id);
-                match txn.get_for_update(skey.clone()).await? {
-                    Some(PersistentValue::BuildUnit(u)) if u.owner == auth.owner => {}
+                let has_self_slot = match txn.get_for_update(skey.clone()).await? {
+                    Some(PersistentValue::BuildUnit(u)) if u.owner == auth.owner => true,
+                    None if attempted_ref.load(std::sync::atomic::Ordering::SeqCst) => false,
                     _ => return Err(Error::new(ErrorKind::BulkBuildSuperseded)),
-                }
+                };
 
                 let collab = slots > 1;
                 let terminal_done = outcome.is_some() || !is_building;
@@ -852,24 +851,37 @@ async fn finish<B: Backend>(
                     (terminal_done && ws_reclaimed) || failed
                 };
                 let mut needs_final_cleanup = false;
-                txn.delete(skey).await?;
+                let mut any_mutation = false;
+                if has_self_slot {
+                    txn.delete(skey).await?;
+                    attempted_ref.store(true, std::sync::atomic::Ordering::SeqCst);
+                    any_mutation = true;
+                }
                 if can_retire_self && active_peers == 0 {
-                    for okey in expired_peers {
+                    let max_peer_del = budget.max_mutations.saturating_sub(2);
+                    let remaining_expired = expired_peers.len() > max_peer_del;
+                    for okey in expired_peers.into_iter().take(max_peer_del) {
                         txn.delete(okey).await?;
+                        any_mutation = true;
                     }
-                    if ws_reclaimed || failed {
+                    if remaining_expired {
+                        needs_final_cleanup = true;
+                    } else if ws_reclaimed || failed {
                         txn.delete(key).await?;
+                        any_mutation = true;
                     } else {
                         needs_final_cleanup = true;
                     }
                 }
-                Ok((
-                    Some(txn),
-                    FinishState {
-                        failed,
-                        needs_final_cleanup,
-                    },
-                ))
+                let state = FinishState {
+                    failed,
+                    needs_final_cleanup,
+                };
+                if !any_mutation {
+                    txn.rollback().await;
+                    return Ok((None, state));
+                }
+                Ok((Some(txn), state))
             }
             .await;
             bulk_worker::commit_raw_prepared(prepared).await
@@ -926,6 +938,8 @@ async fn execute<B: Backend>(
 
     if finish_state.needs_final_cleanup {
         context.bulk_authority = None;
+        context.options = OperationOptions::default()
+            .with_deadline(std::time::Instant::now() + Duration::from_secs(5));
         let _ = bulk_worker::cleanup(&mut context, id, retry).await;
     }
 
@@ -935,6 +949,45 @@ async fn execute<B: Backend>(
         Ok(())
     } else {
         result.map(|_| ())
+    }
+}
+
+async fn has_any_active_slot_in_write<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    id: LogicalIndexId,
+    now: u64,
+) -> Result<bool> {
+    let range = LogicalRange::build_schedule_slots(id);
+    let mut cursor = None;
+    loop {
+        let page = txn
+            .scan(
+                &range,
+                cursor.as_ref(),
+                ScanLimits {
+                    item_limit: 260,
+                    byte_limit: 256 * 1024,
+                },
+            )
+            .await?;
+        for s_item in page.items() {
+            let LogicalKey::BuildScheduleSlot { index, .. } = *s_item.key() else {
+                return Err(bulk_worker::corrupt());
+            };
+            if index != id {
+                return Err(bulk_worker::corrupt());
+            }
+            let PersistentValue::BuildUnit(u) = s_item.value() else {
+                return Err(bulk_worker::corrupt());
+            };
+            if u.owner != [0; 32] && u.expires_ms > now {
+                return Ok(true);
+            }
+        }
+        cursor = page.into_next_cursor();
+        if cursor.is_none() {
+            return Ok(false);
+        }
     }
 }
 
@@ -1032,7 +1085,15 @@ async fn discover<B: Backend>(
                     _ => return Err(bulk_worker::corrupt()),
                 };
                 if is_building {
-                    active_slots < slots
+                    let ws_failed = matches!(
+                        txn.get(LogicalKey::BuildWorkspace(id)).await?,
+                        Some(PersistentValue::BuildWorkspace(w)) if w.failure.is_some()
+                    );
+                    if ws_failed {
+                        active_slots == 0
+                    } else {
+                        active_slots < slots
+                    }
                 } else {
                     active_slots == 0
                 }

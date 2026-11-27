@@ -30,7 +30,10 @@ use crate::storage::values::{
 };
 
 use super::digest::LtHash;
-use super::files::{SegmentFileReader, corrupt, io_error, read_at_exact, write_atomic};
+use super::files::{
+    SegmentFileReader, corrupt, io_error, make_temp_path, read_at_exact, sync_parent_dir,
+    write_temp_file,
+};
 use super::graphs::build_internal_graph;
 use super::input::InputSnapshot;
 use super::plan::{MAX_TOTAL_SHARDS, SAMPLE_SEED, ShardPlan, nearest_center, train_centers};
@@ -67,25 +70,41 @@ where
 
 #[derive(Default)]
 struct QuotaState {
-    live: u64,
     peak: u64,
     written: u64,
     files: BTreeMap<PathBuf, u64>,
+    own_temps: BTreeMap<PathBuf, u64>,
     dir: Option<PathBuf>,
 }
 
+impl QuotaState {
+    fn live_bytes(&self) -> Result<u64> {
+        let committed = self
+            .files
+            .values()
+            .try_fold(0_u64, |acc, &len| acc.checked_add(len))
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+        self.own_temps
+            .values()
+            .try_fold(committed, |acc, &len| acc.checked_add(len))
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))
+    }
+}
+
 /// Tracks simultaneous and cumulative workspace disk bytes against `scratch_bytes`,
-/// reserving exact temporary-file bytes before writing and reconciling on `fs::rename`.
+/// reserving temporary-file bytes before writing and reconciling atomically on `fs::rename`.
 #[derive(Default)]
 pub(crate) struct ScratchQuota {
     limit: u64,
+    shared: bool,
     state: Mutex<QuotaState>,
 }
 
 impl ScratchQuota {
-    pub(crate) fn new(limit: u64) -> Self {
+    pub(crate) fn new(limit: u64, shared: bool) -> Self {
         Self {
             limit,
+            shared,
             state: Mutex::new(QuotaState::default()),
         }
     }
@@ -110,7 +129,7 @@ impl ScratchQuota {
             if entry
                 .file_name()
                 .to_str()
-                .is_some_and(|s| s.starts_with('.'))
+                .is_some_and(|s| s == ".ktann-build-lock")
             {
                 continue;
             }
@@ -127,19 +146,12 @@ impl ScratchQuota {
     }
 
     pub(crate) fn seed_existing(&self, dir: &Path) -> Result<()> {
-        let disk_files = Self::scan_dir_files(dir)?;
-        let disk_sum = disk_files
-            .values()
-            .try_fold(0_u64, |acc, &len| acc.checked_add(len))
-            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        if disk_sum > self.limit {
-            return Err(Error::new(ErrorKind::LimitExceeded));
-        }
         let mut st = self.lock_state();
         st.dir = Some(dir.to_path_buf());
-        st.files = disk_files;
-        st.live = disk_sum;
-        st.peak = st.peak.max(disk_sum);
+        self.refresh_locked(&mut st, Some(dir))?;
+        if st.live_bytes()? > self.limit {
+            return Err(Error::new(ErrorKind::LimitExceeded));
+        }
         Ok(())
     }
 
@@ -151,36 +163,16 @@ impl ScratchQuota {
         else {
             return Ok(());
         };
-        let tracked_sum: u64 = st.files.values().copied().sum();
-        let in_flight_temp = st.live.saturating_sub(tracked_sum);
-        let disk_files = Self::scan_dir_files(&dir)?;
-        let disk_sum = disk_files
-            .values()
-            .try_fold(0_u64, |acc, &len| acc.checked_add(len))
-            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+        if st.dir.is_none() {
+            st.dir = Some(dir.clone());
+        }
+        let mut disk_files = Self::scan_dir_files(&dir)?;
+        for own_tmp in st.own_temps.keys() {
+            disk_files.remove(own_tmp);
+        }
         st.files = disk_files;
-        st.live = disk_sum
-            .checked_add(in_flight_temp)
-            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        st.peak = st.peak.max(st.live);
-        Ok(())
-    }
-
-    fn reserve_temp_bytes(&self, delta: u64, dir: Option<&Path>) -> Result<()> {
-        if delta == 0 {
-            return Ok(());
-        }
-        let mut st = self.lock_state();
-        if st.live.checked_add(delta).is_none_or(|n| n > self.limit) {
-            self.refresh_locked(&mut st, dir)?;
-        }
-        let next = st
-            .live
-            .checked_add(delta)
-            .filter(|&n| n <= self.limit)
-            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        st.live = next;
-        st.peak = st.peak.max(next);
+        let live = st.live_bytes()?;
+        st.peak = st.peak.max(live);
         Ok(())
     }
 
@@ -190,26 +182,25 @@ impl ScratchQuota {
         overwritten_paths: &[&Path],
     ) -> Result<()> {
         let mut st = self.lock_state();
-        let credit = |s: &QuotaState| -> u64 {
-            overwritten_paths
+        let dir = overwritten_paths.first().and_then(|p| p.parent());
+        if self.shared || st.dir.is_none() {
+            self.refresh_locked(&mut st, dir)?;
+        }
+        let fits = |s: &QuotaState| -> Result<bool> {
+            let credit: u64 = overwritten_paths
                 .iter()
                 .filter_map(|p| s.files.get(*p).copied())
-                .sum()
-        };
-        if st
-            .live
-            .saturating_sub(credit(&st))
-            .checked_add(total_new_bytes)
-            .is_none_or(|n| n > self.limit)
-        {
-            let dir = overwritten_paths.first().and_then(|p| p.parent());
-            self.refresh_locked(&mut st, dir)?;
-            if st
-                .live
-                .saturating_sub(credit(&st))
+                .sum();
+            Ok(s.live_bytes()?
+                .saturating_sub(credit)
                 .checked_add(total_new_bytes)
-                .is_none_or(|n| n > self.limit)
-            {
+                .is_some_and(|n| n <= self.limit))
+        };
+        if !fits(&st)? {
+            if !self.shared {
+                self.refresh_locked(&mut st, dir)?;
+            }
+            if !fits(&st)? {
                 return Err(Error::new(ErrorKind::LimitExceeded));
             }
         }
@@ -220,34 +211,71 @@ impl ScratchQuota {
         &self,
         path: &Path,
         expected_bytes: u64,
+        check: &dyn Fn() -> Result<()>,
         write_fn: impl FnOnce(&mut BufWriter<File>) -> Result<()>,
     ) -> Result<u64> {
-        self.reserve_temp_bytes(expected_bytes, path.parent())?;
-        match write_atomic(path, write_fn) {
-            Ok(actual) => {
-                let mut st = self.lock_state();
-                let old_bytes = st.files.insert(path.to_path_buf(), actual).unwrap_or(0);
-                st.live = st
-                    .live
-                    .saturating_sub(expected_bytes)
-                    .saturating_sub(old_bytes)
-                    .saturating_add(actual);
-                st.peak = st.peak.max(st.live);
-                st.written = st.written.saturating_add(actual);
-                Ok(actual)
+        check()?;
+        let temp_path = make_temp_path(path)?;
+        {
+            let mut st = self.lock_state();
+            if self.shared || st.dir.is_none() {
+                self.refresh_locked(&mut st, path.parent())?;
             }
-            Err(err) => {
-                let mut st = self.lock_state();
-                st.live = st.live.saturating_sub(expected_bytes);
-                Err(err)
-            }
+            let fits = |s: &QuotaState| -> Result<Option<u64>> {
+                let credit = s.files.get(path).copied().unwrap_or(0);
+                let projected = s
+                    .live_bytes()?
+                    .saturating_sub(credit)
+                    .checked_add(expected_bytes);
+                Ok(projected.filter(|&n| n <= self.limit))
+            };
+            let projected = match fits(&st)? {
+                Some(p) => p,
+                None if !self.shared => {
+                    self.refresh_locked(&mut st, path.parent())?;
+                    fits(&st)?.ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?
+                }
+                None => return Err(Error::new(ErrorKind::LimitExceeded)),
+            };
+            st.own_temps.insert(temp_path.clone(), expected_bytes);
+            st.peak = st.peak.max(projected);
         }
+
+        let actual = match write_temp_file(&temp_path, write_fn) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                self.lock_state().own_temps.remove(&temp_path);
+                return Err(err);
+            }
+        };
+
+        {
+            let mut st = self.lock_state();
+            if let Err(err) = check() {
+                st.own_temps.remove(&temp_path);
+                drop(st);
+                let _ = fs::remove_file(&temp_path);
+                return Err(err);
+            }
+            if let Err(err) = fs::rename(&temp_path, path) {
+                st.own_temps.remove(&temp_path);
+                drop(st);
+                let _ = fs::remove_file(&temp_path);
+                return Err(io_error(err));
+            }
+            st.own_temps.remove(&temp_path);
+            st.files.insert(path.to_path_buf(), actual);
+            if let Ok(live) = st.live_bytes() {
+                st.peak = st.peak.max(live);
+            }
+            st.written = st.written.saturating_add(actual);
+        }
+        sync_parent_dir(path)?;
+        Ok(actual)
     }
 
-    pub(crate) fn release_path(&self, path: &Path, fallback_bytes: u64) {
-        let mut st = self.lock_state();
-        let bytes = st.files.remove(path).unwrap_or(fallback_bytes);
-        st.live = st.live.saturating_sub(bytes);
+    pub(crate) fn release_path(&self, path: &Path) {
+        self.lock_state().files.remove(path);
     }
 
     pub(crate) fn peak(&self) -> u64 {
@@ -1160,7 +1188,7 @@ pub(crate) struct LeafPlan {
 /// Encoded RecordLocation KV batch together with its KV and membership `LtHash` digests.
 pub(crate) type EncodedLocationBatch = (Vec<(Bytes, Bytes)>, LtHash, LtHash);
 
-type InternalNodePlan = (
+pub(crate) type InternalNodePlan = (
     PartitionKey,
     u32,
     PartitionCentroid,
@@ -1490,28 +1518,28 @@ pub(crate) struct EncodedUpperTree {
     pub edge_ref_lthash: LtHash,
 }
 
-/// Builds and encodes internal levels (`level >= 2`) and `TreeManifest` for one tree.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "upper-tree builder passes manifest, tree identity, children, sampling/graph/backend limits, and cancellation"
-)]
-pub(crate) fn build_and_encode_upper_tree(
+/// Planned upper-tree `TreeManifest` KV and bottom-up internal partitions sorted by `PartitionKey`.
+pub(crate) struct UpperTreePlan {
+    pub tree_manifest_kv: (Bytes, Bytes),
+    pub internal_nodes: Vec<InternalNodePlan>,
+}
+
+/// Plans internal levels (`level >= 2`) and encodes `TreeManifest` for one tree.
+pub(crate) fn plan_upper_tree(
     manifest: &IndexManifest,
     tree_key: &TreeKey,
     total_leaves: u64,
     mut children: Vec<(PartitionKey, PartitionCentroid)>,
     sample_items: usize,
-    graph_memory_bytes: usize,
     hard_limits: HardLimits,
-    parallelism: usize,
     check: &(dyn Fn() -> Result<()> + Sync),
-) -> Result<EncodedUpperTree> {
+) -> Result<UpperTreePlan> {
     check()?;
     let index_id = manifest.logical_index_id();
     let codec = ValueCodec::for_index(manifest);
 
     if total_leaves == 1 {
-        let tm = encode_kv(
+        let tree_manifest_kv = encode_kv(
             codec,
             hard_limits,
             LogicalKey::TreeManifest {
@@ -1523,13 +1551,9 @@ pub(crate) fn build_and_encode_upper_tree(
                 PartitionKey::new(1)?,
             )?),
         )?;
-        let kv_lthash = LtHash::from_kv(&tm.0, &tm.1);
-        return Ok(EncodedUpperTree {
-            partitions: 0,
-            kvs: vec![tm],
-            kv_lthash,
-            edge_def_lthash: LtHash::ZERO,
-            edge_ref_lthash: LtHash::ZERO,
+        return Ok(UpperTreePlan {
+            tree_manifest_kv,
+            internal_nodes: Vec::new(),
         });
     }
 
@@ -1578,9 +1602,52 @@ pub(crate) fn build_and_encode_upper_tree(
             .checked_add(1)
             .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
     }
+    internal_nodes.sort_unstable_by_key(|(pk, ..)| *pk);
+    let tree_manifest_kv = encode_kv(
+        codec,
+        hard_limits,
+        LogicalKey::TreeManifest {
+            index: index_id,
+            tree_key: tree_key.clone(),
+        },
+        PersistentValue::TreeManifest(TreeManifest::new(
+            PartitionKey::new(1)?,
+            PartitionKey::new(high_water)?,
+        )?),
+    )?;
+    Ok(UpperTreePlan {
+        tree_manifest_kv,
+        internal_nodes,
+    })
+}
+
+/// Encodes a slice of planned internal partitions and builds their partition-local HNSW graphs.
+pub(crate) fn encode_upper_tree_nodes(
+    manifest: &IndexManifest,
+    tree_key: &TreeKey,
+    internal_nodes: &[InternalNodePlan],
+    per_thread_graph_memory_bytes: usize,
+    hard_limits: HardLimits,
+    parallelism: usize,
+    check: &(dyn Fn() -> Result<()> + Sync),
+) -> Result<EncodedUpperTree> {
+    check()?;
+    if internal_nodes.is_empty() {
+        return Ok(EncodedUpperTree {
+            partitions: 0,
+            kvs: Vec::new(),
+            kv_lthash: LtHash::ZERO,
+            edge_def_lthash: LtHash::ZERO,
+            edge_ref_lthash: LtHash::ZERO,
+        });
+    }
+    let index_id = manifest.logical_index_id();
+    let codec = ValueCodec::for_index(manifest);
+    let kernel = kernel_for(manifest)?;
+    let workers = parallelism.max(1).min(internal_nodes.len());
 
     let node_results: Vec<EncodedNodeBatch> =
-        parallel_chunks(&internal_nodes, parallelism, |_, chunk| {
+        parallel_chunks(internal_nodes, workers, |_, chunk| {
             let mut kvs = Vec::new();
             let mut kv_lt = LtHash::ZERO;
             let mut def_lt = LtHash::ZERO;
@@ -1664,7 +1731,7 @@ pub(crate) fn build_and_encode_upper_tree(
                     *pk,
                     header,
                     &typed_children,
-                    graph_memory_bytes,
+                    per_thread_graph_memory_bytes,
                     check,
                 )?;
                 for (gk, gv) in graph_items {
@@ -1676,22 +1743,10 @@ pub(crate) fn build_and_encode_upper_tree(
             Ok((kvs, kv_lt, def_lt, ref_lt))
         })?;
 
-    let tm_kv = encode_kv(
-        codec,
-        hard_limits,
-        LogicalKey::TreeManifest {
-            index: index_id,
-            tree_key: tree_key.clone(),
-        },
-        PersistentValue::TreeManifest(TreeManifest::new(
-            PartitionKey::new(1)?,
-            PartitionKey::new(high_water)?,
-        )?),
-    )?;
-    let mut kv_lthash = LtHash::from_kv(&tm_kv.0, &tm_kv.1);
+    let mut kv_lthash = LtHash::ZERO;
     let mut edge_def_lthash = LtHash::ZERO;
     let mut edge_ref_lthash = LtHash::ZERO;
-    let mut kvs = vec![tm_kv];
+    let mut kvs = Vec::new();
 
     for (part_kvs, kv_lt, def_lt, ref_lt) in node_results {
         kv_lthash.add_assign(kv_lt);
@@ -1828,12 +1883,13 @@ pub(crate) fn write_checksummed_bytes(
     path: &Path,
     body: &[u8],
     quota: &ScratchQuota,
+    check: &dyn Fn() -> Result<()>,
 ) -> Result<u64> {
     let checksum = xxh3_64(body);
     let total_len = (body.len() as u64)
         .checked_add(8)
         .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-    quota.write_exact(path, total_len, |w| {
+    quota.write_exact(path, total_len, check, |w| {
         w.write_all(body).map_err(io_error)?;
         w.write_all(&checksum.to_be_bytes()).map_err(io_error)
     })
@@ -1860,6 +1916,7 @@ pub(crate) fn write_indexed_slices(
     slices: &[Vec<u8>],
     item_counts: Option<&[u64]>,
     quota: &ScratchQuota,
+    check: &dyn Fn() -> Result<()>,
 ) -> Result<u64> {
     if item_counts.is_some_and(|c| c.len() != slices.len()) {
         return Err(Error::invalid_argument());
@@ -1876,7 +1933,7 @@ pub(crate) fn write_indexed_slices(
         .checked_add(body_bytes)
         .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
 
-    quota.write_exact(path, total_bytes, |w| {
+    quota.write_exact(path, total_bytes, check, |w| {
         w.write_all(&count.to_be_bytes()).map_err(io_error)?;
         let mut cursor = header_bytes;
         for (idx, slice) in slices.iter().enumerate() {
@@ -2313,6 +2370,67 @@ pub(crate) fn encode_leaf_keys_plan(leaf_plan: &LeafPlan, tree_buckets: u32) -> 
     Ok(buf)
 }
 
+pub(crate) type DonorRow = (u32, CompactMeta, Vec<f32>);
+
+pub(crate) fn encode_outbound_slices(
+    manifest: &IndexManifest,
+    slices: &[Vec<DonorRow>],
+) -> Result<(Vec<Vec<u8>>, Vec<u64>)> {
+    let _ = u32::try_from(slices.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
+    let config = manifest.config();
+    let mut raw_slices = Vec::with_capacity(slices.len());
+    let mut counts = Vec::with_capacity(slices.len());
+    for rows in slices {
+        let count = u32::try_from(rows.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
+        counts.push(u64::from(count));
+        let mut buf = Vec::new();
+        if count > 0 {
+            buf.extend_from_slice(&count.to_be_bytes());
+            for (dst_local_leaf, meta, vec) in rows {
+                buf.extend_from_slice(&dst_local_leaf.to_be_bytes());
+                encode_compact_row(&mut buf, config, meta, vec)?;
+            }
+        }
+        raw_slices.push(buf);
+    }
+    Ok((raw_slices, counts))
+}
+
+pub(crate) fn decode_outbound_slice(
+    raw: &[u8],
+    manifest: &IndexManifest,
+    out: &mut Vec<DonorRow>,
+) -> Result<()> {
+    let mut r = ScratchCursor::new(raw);
+    let count = r.u32()? as usize;
+    let config = manifest.config();
+    let (types, type_count) = manifest.tree_key_types();
+    let tree_types = &types[..type_count];
+    let dim = config.dimension();
+    if count == 0 || (count as u64).saturating_mul((12 + dim * 4) as u64) > (r.buf.len() as u64) {
+        return Err(corrupt());
+    }
+    out.reserve(count.min(65_536));
+    let mut vec_f32 = vec![0.0_f32; dim];
+    for _ in 0..count {
+        let dst_local_leaf = r.u32()?;
+        let tree_key = r.tree_key(tree_types)?;
+        let (id, fields) = source::decode_row_meta(config, r.non_empty_bytes(MAX_VALUE_BYTES)?)?;
+        r.f32s_into(&mut vec_f32)?;
+        out.push((
+            dst_local_leaf,
+            CompactMeta {
+                tree_key,
+                id,
+                fields,
+                vec_slot: 0,
+            },
+            vec_f32.clone(),
+        ));
+    }
+    r.finish()
+}
+
 pub(crate) fn decode_leaf_keys_plan(
     raw: &[u8],
     expected_shards: u32,
@@ -2325,6 +2443,9 @@ pub(crate) fn decode_leaf_keys_plan(
     }
     let scatter_records = r.u64()?;
     let final_round = r.u8()?;
+    if usize::from(final_round) > crate::api::MAX_REFINEMENT_ROUNDS {
+        return Err(corrupt());
+    }
     let tree_buckets = r.u32()?;
     if tree_buckets != expected_tree_buckets || tree_buckets == 0 {
         return Err(corrupt());
@@ -2336,6 +2457,7 @@ pub(crate) fn decode_leaf_keys_plan(
     let (types, tcount) = manifest.tree_key_types();
     let tree_types = &types[..tcount];
     let mut trees: Vec<TreePlanEntry> = Vec::with_capacity(tree_count.min(65_536));
+    let mut total_declared_leaves = 0_u64;
     for _ in 0..tree_count {
         let tk = r.tree_key(tree_types)?;
         let total_leaves = r.u64()?;
@@ -2346,6 +2468,9 @@ pub(crate) fn decode_leaf_keys_plan(
         {
             return Err(corrupt());
         }
+        total_declared_leaves = total_declared_leaves
+            .checked_add(total_leaves)
+            .ok_or_else(corrupt)?;
         trees.push(TreePlanEntry {
             tree_bucket: tree_bucket_for(&tk, tree_buckets),
             tree_key: tk,
@@ -2356,24 +2481,39 @@ pub(crate) fn decode_leaf_keys_plan(
     if shard_count != expected_shards || (shard_count as usize) > MAX_TOTAL_SHARDS {
         return Err(corrupt());
     }
+    if scatter_records == 0 {
+        if final_round != 0 || !trees.is_empty() {
+            return Err(corrupt());
+        }
+    } else if trees.is_empty() || total_declared_leaves > scatter_records {
+        return Err(corrupt());
+    }
+
+    let mut seen_pks_by_tree: Vec<Vec<u64>> = vec![Vec::new(); trees.len()];
     let mut assigned = Vec::with_capacity(shard_count as usize);
     for _ in 0..shard_count {
         let k_len = r.u32()? as usize;
-        if (k_len as u64).saturating_mul(13) > (raw.len() as u64) {
+        if (k_len as u64).saturating_mul(13) > (raw.len() as u64)
+            || (scatter_records == 0 && k_len != 0)
+        {
             return Err(corrupt());
         }
         let mut keys = Vec::with_capacity(k_len);
         for _ in 0..k_len {
             let tree_id = r.u32()?;
-            if (tree_id as usize) >= trees.len() {
+            let Some(tree_entry) = trees.get(tree_id as usize) else {
                 return Err(corrupt());
-            }
+            };
             let pk = PartitionKey::new(r.u64()?).map_err(|_| corrupt())?;
             let is_single_leaf_root = match r.u8()? {
                 0 => false,
                 1 => true,
                 _ => return Err(corrupt()),
             };
+            if is_single_leaf_root != (tree_entry.total_leaves == 1) {
+                return Err(corrupt());
+            }
+            seen_pks_by_tree[tree_id as usize].push(pk.get());
             keys.push(AssignedLeafKey {
                 tree_id,
                 partition_key: pk,
@@ -2383,6 +2523,29 @@ pub(crate) fn decode_leaf_keys_plan(
         assigned.push(keys);
     }
     r.finish()?;
+
+    for (tree_entry, mut pks) in trees.iter().zip(seen_pks_by_tree) {
+        if pks.len() as u64 != tree_entry.total_leaves {
+            return Err(corrupt());
+        }
+        pks.sort_unstable();
+        if tree_entry.total_leaves == 1 {
+            if pks.as_slice() != [1] {
+                return Err(corrupt());
+            }
+        } else {
+            let expected_last = 1_u64
+                .checked_add(tree_entry.total_leaves)
+                .ok_or_else(corrupt)?;
+            if pks[0] != 2
+                || pks[pks.len() - 1] != expected_last
+                || pks.windows(2).any(|w| w[0] >= w[1])
+            {
+                return Err(corrupt());
+            }
+        }
+    }
+
     Ok(LeafPlan {
         scatter_records,
         final_round,

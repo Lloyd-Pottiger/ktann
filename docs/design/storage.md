@@ -278,8 +278,8 @@ Bulk Build persists six logical key families:
   writer-fence token (`[0; 32]` once frozen for validation), attempt epoch, and
   terminal failure. Its namespace scope lets cleanup survive index deletion.
 - **Build Unit** (`0x07`, value `0x10`, keyed by `(index, stage, unit)`) records
-  disk stage work units (`stage = 1..32`, including `Propose = 10+2r` and
-  `Apply = 11+2r`) and parallel validation slices
+  disk stage work units (`stage = 1..32`, including `Propose = 10+3r`,
+  `Extract = 11+3r`, and `Apply = 12+3r`) and parallel validation slices
   (`stage = 40`), carrying the build epoch, renewable worker owner token/expiry,
   completion flag, counts, and 512-bit `LtHash` digests. Post-publication
   cleanup reclaims `[0x07..0x08)` (`BuildUnit`s) while compact

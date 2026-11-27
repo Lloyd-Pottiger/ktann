@@ -24,12 +24,11 @@ use super::sharded::{
 
 pub(super) const SAMPLE_SEED: u64 = 0x6b74_616e_6e62_756c;
 const PLAN_MAGIC: &[u8; 8] = b"KTANNPL2";
-const MAX_SAMPLE_CAP: usize = 32_768;
+const MAX_PLAN_SAMPLES: usize = 131_072;
 const MAX_ID_BUCKETS: usize = 4_096;
 const TARGET_ID_BUCKET_ROWS: u64 = 16_384;
 const DEFAULT_SHARD_TARGET_ROWS: u64 = 16_384;
 pub(crate) const MAX_TOTAL_SHARDS: usize = 65_536;
-const MAX_LIGHT_SHARDS: u32 = 1_024;
 
 type TreeSampleMap = BTreeMap<Bytes, (TreeKey, Vec<(Bytes, Box<[f32]>)>)>;
 type SuperIndex = (Vec<Box<[f32]>>, Vec<Vec<u32>>);
@@ -156,10 +155,15 @@ impl ShardPlan {
             .max(scale_floor)
             .max(min_shard_rows);
 
-        // Bound sample capacity by construction policy and available working memory.
+        // Bound reservoir sample capacity by construction policy, desired coarse shard count,
+        // and available working memory.
         let mem_sample_cap = (worker_memory_bytes / 2 / row_bytes.max(1)).max(2);
+        let desired_shards = total_items
+            .div_ceil(target_shard_rows as u64)
+            .clamp(1, MAX_TOTAL_SHARDS as u64) as usize;
         let sample_cap = sample_items
-            .clamp(4_096, MAX_SAMPLE_CAP)
+            .max(desired_shards.saturating_mul(2))
+            .min(MAX_PLAN_SAMPLES)
             .min(mem_sample_cap);
 
         let segments = snapshot.segments();
@@ -246,31 +250,51 @@ impl ShardPlan {
                 .push((s.id, s.rot_vec));
         }
 
-        let reserved_light = if config.tree_key_fields().is_empty() {
-            1_usize
-        } else {
-            MAX_LIGHT_SHARDS as usize
-        };
-        let max_heavy_budget = MAX_TOTAL_SHARDS - reserved_light;
+        let has_tree_fields = !config.tree_key_fields().is_empty();
+        let initial_heavy_cap = MAX_TOTAL_SHARDS - usize::from(has_tree_fields);
 
         let mut heavy_candidates = Vec::new();
-        let mut light_est_rows = 0_u64;
         for (_, (tree_key, tree_samples)) in by_tree {
             let est_rows =
                 ((tree_samples.len() as u128 * total_items as u128) / sample_len as u128) as u64;
             if est_rows > target_shard_rows as u64 && tree_samples.len() >= 2 {
                 let desired = est_rows
                     .div_ceil(target_shard_rows as u64)
-                    .clamp(2, max_heavy_budget as u64) as usize;
+                    .clamp(2, initial_heavy_cap as u64) as usize;
                 let k = desired.min(tree_samples.len()).max(2);
                 heavy_candidates.push((tree_key, tree_samples, est_rows, k));
-            } else {
-                light_est_rows = light_est_rows.saturating_add(est_rows.max(1));
             }
         }
 
-        // Enforce global `MAX_TOTAL_SHARDS` ceiling across all heavy trees combined.
+        let raw_heavy_est: u64 = heavy_candidates
+            .iter()
+            .fold(0_u64, |acc, c| acc.saturating_add(c.2));
+        let raw_light_est = total_items.saturating_sub(raw_heavy_est);
+        let needs_light_initial = has_tree_fields || heavy_candidates.is_empty();
+        let desired_light = if needs_light_initial {
+            raw_light_est
+                .max(1)
+                .div_ceil(target_shard_rows as u64)
+                .clamp(1, MAX_TOTAL_SHARDS as u64) as usize
+        } else {
+            0
+        };
         let sum_heavy_k: usize = heavy_candidates.iter().map(|c| c.3).sum();
+        let max_heavy_budget = if !needs_light_initial {
+            MAX_TOTAL_SHARDS
+        } else if heavy_candidates.is_empty() {
+            0
+        } else if sum_heavy_k.saturating_add(desired_light) <= MAX_TOTAL_SHARDS {
+            MAX_TOTAL_SHARDS - desired_light
+        } else {
+            let total_desired = sum_heavy_k.saturating_add(desired_light).max(1) as u128;
+            let reserved_light = ((desired_light as u128 * MAX_TOTAL_SHARDS as u128)
+                / total_desired)
+                .clamp(1, (MAX_TOTAL_SHARDS - 2) as u128) as usize;
+            MAX_TOTAL_SHARDS - reserved_light
+        };
+
+        // Enforce global `MAX_TOTAL_SHARDS` ceiling across all heavy trees combined.
         if sum_heavy_k > max_heavy_budget {
             // Keep the largest heavy trees if there are more than `max_heavy_budget / 2` candidates.
             if heavy_candidates.len() * 2 > max_heavy_budget {
@@ -278,9 +302,7 @@ impl ShardPlan {
                     b.2.cmp(&a.2)
                         .then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
                 });
-                for (_, _, est, _) in heavy_candidates.drain(max_heavy_budget / 2..) {
-                    light_est_rows = light_est_rows.saturating_add(est.max(1));
-                }
+                heavy_candidates.truncate(max_heavy_budget / 2);
                 heavy_candidates.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
             }
             let remaining_sum: usize = heavy_candidates.iter().map(|c| c.3).sum();
@@ -296,11 +318,18 @@ impl ShardPlan {
             }
         }
 
+        let kept_heavy_est: u64 = heavy_candidates
+            .iter()
+            .fold(0_u64, |acc, c| acc.saturating_add(c.2));
+        let light_est_rows = total_items.saturating_sub(kept_heavy_est);
+
         let mut heavy_trees = Vec::with_capacity(heavy_candidates.len());
         let mut next_shard = 0_u32;
         for (tree_key, tree_samples, _, k) in heavy_candidates {
             check()?;
-            let train_cap = sample_items.max(k * 16).min(tree_samples.len());
+            let train_cap = sample_items
+                .max(k.saturating_mul(2))
+                .min(tree_samples.len());
             let stride = (tree_samples.len() / train_cap.max(1)).max(1);
             let train_samples: Vec<_> = tree_samples
                 .into_iter()
@@ -327,13 +356,13 @@ impl ShardPlan {
 
         // Always keep at least one light shard if the schema has Tree Key fields
         // (so unseen Tree Keys have a deterministic home) or when no heavy trees exist.
-        let needs_light = !config.tree_key_fields().is_empty() || heavy_trees.is_empty();
+        let needs_light = has_tree_fields || heavy_trees.is_empty();
         let remaining_shards = (MAX_TOTAL_SHARDS as u32).saturating_sub(next_shard);
         let light_shard_count = if needs_light {
             (light_est_rows
                 .max(1)
                 .div_ceil(target_shard_rows as u64)
-                .clamp(1, u64::from(MAX_LIGHT_SHARDS)) as u32)
+                .clamp(1, MAX_TOTAL_SHARDS as u64) as u32)
                 .min(remaining_shards.max(1))
         } else {
             0
@@ -443,7 +472,12 @@ impl ShardPlan {
     }
 
     /// Persists the deterministic plan to `workspace/{token}/plan-e{epoch}.bin` under `quota`.
-    pub(crate) fn save(&self, path: &Path, quota: &ScratchQuota) -> Result<u64> {
+    pub(crate) fn save(
+        &self,
+        path: &Path,
+        quota: &ScratchQuota,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<u64> {
         let id_bounds_len = u32::try_from(self.id_bounds.len())
             .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
         let heavy_len = u32::try_from(self.heavy_trees.len())
@@ -470,13 +504,14 @@ impl ShardPlan {
                 push_f32s(&mut buf, center)?;
             }
         }
-        write_checksummed_bytes(path, &buf, quota)
+        write_checksummed_bytes(path, &buf, quota, check)
     }
 
     /// Loads and validates a persisted plan from `workspace/{token}/plan-e{epoch}.bin`.
     pub(crate) fn load(
         path: &Path,
         manifest: &IndexManifest,
+        expected_items: u64,
         check: &(dyn Fn() -> Result<()> + Sync),
     ) -> Result<Self> {
         check()?;
@@ -494,8 +529,9 @@ impl ShardPlan {
         let light_shard_count = r.u32()?;
         let total_shards = r.u32()?;
         if (total_shards as usize) > MAX_TOTAL_SHARDS
-            || light_shard_count > MAX_LIGHT_SHARDS
             || light_shard_start.checked_add(light_shard_count) != Some(total_shards)
+            || (expected_items == 0 && total_shards != 0)
+            || (expected_items > 0 && total_shards == 0)
         {
             return Err(corrupt());
         }
@@ -571,8 +607,11 @@ impl ShardPlan {
                 super_children,
             });
         }
+        let needs_light =
+            total_shards > 0 && (!config.tree_key_fields().is_empty() || heavy_trees.is_empty());
         if expected_shard_start != light_shard_start
             || (config.tree_key_fields().is_empty() && heavy_trees.len() > 1)
+            || (needs_light != (light_shard_count > 0))
         {
             return Err(corrupt());
         }
@@ -659,13 +698,27 @@ fn nearest_indexed_center(
 /// train in `O(N * sqrt(k))` distance evaluations instead of `O(N * k)`.
 fn train_centers_hierarchical(
     kernel: &VectorKernel,
-    entries: Vec<(Bytes, Box<[f32]>)>,
+    mut entries: Vec<(Bytes, Box<[f32]>)>,
     k: usize,
     max_iters: usize,
     check: &(dyn Fn() -> Result<()> + Sync),
 ) -> Result<Vec<Box<[f32]>>> {
-    if k <= 64 || entries.len() < k.saturating_mul(2) {
+    if k <= 64 {
         return train_centers(kernel, entries, k, max_iters, check);
+    }
+    if entries.len() <= k {
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut out = Vec::with_capacity(k);
+        for (i, (_, v)) in entries.into_iter().enumerate() {
+            if i.is_multiple_of(256) {
+                check()?;
+            }
+            out.push(kernel.normalize_centroid(&v)?);
+        }
+        while out.len() < k && !out.is_empty() {
+            out.push(out[0].clone());
+        }
+        return Ok(out);
     }
     let super_k = (k as f64).sqrt().ceil().clamp(2.0, 256.0) as usize;
     let stride = (entries.len() / (super_k * 32).max(1)).max(1);
@@ -754,10 +807,16 @@ pub(crate) fn train_centers(
             *s += f64::from(*v);
         }
     }
-    let mean: Vec<f32> = mean
+    let mut mean: Vec<f32> = mean
         .into_iter()
         .map(|v| (v / entries.len() as f64) as f32)
         .collect();
+    if kernel.is_cosine() {
+        mean = match kernel.normalize_centroid(&mean) {
+            Ok(normed) => normed.into_vec(),
+            Err(_) => entries[0].1.to_vec(),
+        };
+    }
 
     let mut seeds: Vec<Box<[f32]>> = Vec::with_capacity(k);
     let mut min_dists = vec![f64::INFINITY; entries.len()];

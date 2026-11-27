@@ -397,6 +397,7 @@ impl<B: Backend> BulkBuildJob<B> {
         options: BulkWorkerOptions,
         control: OperationOptions,
     ) -> Result<(super::Index<B>, BulkBuildReport)> {
+        let (control, _drop_guard) = crate::runtime::bulk_worker::drop_guarded_options(&control);
         let manifest = self.manifest.clone();
         let descriptor = self.descriptor.clone();
         let retry = lifecycle::RetryPolicy::from_config(self.runtime.inner.config());
@@ -436,6 +437,7 @@ impl<B: Backend> BulkBuildJob<B> {
         options: BulkWorkerOptions,
         control: OperationOptions,
     ) -> Result<()> {
+        let (control, _drop_guard) = crate::runtime::bulk_worker::drop_guarded_options(&control);
         let manifest = self.manifest.clone();
         let descriptor = self.descriptor.clone();
         let retry = lifecycle::RetryPolicy::from_config(self.runtime.inner.config());
@@ -468,6 +470,7 @@ impl<B: Backend> BulkBuildJob<B> {
 
     /// Publishes with cancellation and deadline control.
     pub async fn publish_with_control(&self, control: OperationOptions) -> Result<super::Index<B>> {
+        let (control, _drop_guard) = crate::runtime::bulk_worker::drop_guarded_options(&control);
         let manifest = self.manifest.clone();
         let descriptor = self.descriptor.clone();
         let retry = lifecycle::RetryPolicy::from_config(self.runtime.inner.config());

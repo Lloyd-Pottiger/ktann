@@ -23,17 +23,18 @@ use crate::api::{
 use crate::bulk::files::io_error;
 use crate::bulk::plan::MAX_TOTAL_SHARDS;
 use crate::bulk::sharded::{
-    AssignedLeafKey, CompactMeta, INDEX_ENTRY_BYTES, IdFrameEntry, LeafPlan, MAX_HALO_LEAVES_CAP,
+    AssignedLeafKey, DonorRow, INDEX_ENTRY_BYTES, IdFrameEntry, LeafPlan, MAX_HALO_LEAVES_CAP,
     MoveProposal, ScratchQuota, SegmentIngest, ShardRows, ShardState, TreePlanEntry,
-    apply_moves_to_shard, arbitrate_tree_proposals, assign_leaf_partition_keys,
-    build_and_encode_upper_tree, build_shard_leaves, compute_shard_remap, decode_id_refs,
-    decode_id_slice, decode_leaf_keys_plan, decode_locations_slice, decode_proposals,
-    decode_shard_centers, decode_shard_slice, decode_shard_state, encode_id_buckets,
-    encode_id_refs, encode_leaf_keys_plan, encode_leaf_shard, encode_proposals,
+    apply_moves_to_shard, arbitrate_tree_proposals, assign_leaf_partition_keys, build_shard_leaves,
+    compute_shard_remap, decode_id_refs, decode_id_slice, decode_leaf_keys_plan,
+    decode_locations_slice, decode_outbound_slice, decode_proposals, decode_shard_centers,
+    decode_shard_slice, decode_shard_state, encode_id_buckets, encode_id_refs,
+    encode_leaf_keys_plan, encode_leaf_shard, encode_outbound_slices, encode_proposals,
     encode_record_group_bucket, encode_shard_locations, encode_shard_slices, encode_shard_state,
-    ingest_segment_range, parallel_chunks, read_checksummed_bytes, read_indexed_counts,
-    read_indexed_slice, refine_single_light_shard, refinement_per_leaf_bytes, score_halo_shard,
-    verify_id_bucket, write_checksummed_bytes, write_indexed_slices,
+    encode_upper_tree_nodes, ingest_segment_range, parallel_chunks, plan_upper_tree,
+    read_checksummed_bytes, read_indexed_counts, read_indexed_slice, refine_single_light_shard,
+    refinement_per_leaf_bytes, score_halo_shard, verify_id_bucket, write_checksummed_bytes,
+    write_indexed_slices,
 };
 use crate::bulk::{InputSnapshot, LtHash, ShardPlan};
 use crate::maintenance::routing::kernel_for;
@@ -50,21 +51,21 @@ use crate::storage::values::{
 use crate::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn};
 
 use super::{
-    CommitStep, MAX_WRITER_LANES, OperationContext, RetryPolicy, SealedSummary, UnitLease,
-    WriteFence, advance_loading_progress, building_in_flight, check_manifest_building_in_flight,
-    check_writer_fence, clear_stale_serving_data, commit_raw_prepared, corrupt,
-    drop_guarded_options, effective_budget, finalize_and_seal_loaded, lock_sched_read,
-    retry_raw_write, retry_read, seal_loaded, validate_split_keys_in_index,
+    BUILD_UNIT_MUTATION_BYTES, CommitStep, MAX_WRITER_LANES, OperationContext, RetryPolicy,
+    SealedSummary, UnitLease, WriteFence, advance_loading_progress, building_in_flight,
+    check_manifest_building_in_flight, check_writer_fence, clear_stale_serving_data,
+    commit_raw_prepared, corrupt, drop_guarded_options, effective_budget, finalize_and_seal_loaded,
+    lock_sched_read, retry_raw_write, retry_read, seal_loaded, validate_split_keys_in_index,
 };
 
 const STAGE_SCATTER: u8 = 1;
 const STAGE_DEDUP: u8 = 2;
 const STAGE_LEAVES: u8 = 3;
-const STAGE_REFINE_BASE: u8 = 10; // 10 + 2*r = Propose, 11 + 2*r = Apply
+const STAGE_REFINE_BASE: u8 = 10; // 10 + 3*r = Propose, 11 + 3*r = Extract, 12 + 3*r = Apply
 const STAGE_EMIT_LOCS: u8 = 29; // Disk early-convergence fallback when final_round < rounds
-const STAGE_EMIT_RECORDS: u8 = 30;
-const STAGE_EMIT_TREES: u8 = 31;
-const STAGE_EMIT_LEAVES: u8 = 32;
+pub(crate) const STAGE_EMIT_RECORDS: u8 = 30;
+pub(crate) const STAGE_EMIT_TREES: u8 = 31;
+pub(crate) const STAGE_EMIT_LEAVES: u8 = 32;
 
 type UpperTreeBucket = (TreeKey, u64, Vec<(PartitionKey, PartitionCentroid)>);
 type RecordLocationEntry = (Bytes, TreeKey, PartitionKey);
@@ -279,7 +280,7 @@ impl<B: Backend> StageEnv<B> {
         let mut txn = WriteLogicalTxn::bootstrap(
             self.backend.begin_write().await?,
             self.backend.hard_limits(),
-            self.backend.admission_budget(),
+            self.budget,
         );
         let mut warm = self.fence.warm_keys(id, self.bulk_authority, ukey);
         warm.extend(extra_warm);
@@ -414,6 +415,7 @@ struct MemoryStageData {
     shards: BTreeMap<(u8, u32), ShardState>,
     locs: BTreeMap<(u8, u32), BucketLocations>,
     proposals: BTreeMap<(u8, u32), Vec<MoveProposal>>,
+    outbound: BTreeMap<(u8, u32), Vec<Vec<DonorRow>>>,
 }
 
 /// Typed intermediate stage store backing the unified Bulk Build pipeline.
@@ -432,24 +434,6 @@ enum StoreBackend {
         dir: PathBuf,
         quota: Arc<ScratchQuota>,
     },
-}
-
-fn extract_donor_rows(
-    donor: &ShardState,
-    items: &[(usize, u32)],
-    out: &mut Vec<(u32, CompactMeta, Vec<f32>)>,
-) -> Result<()> {
-    for &(src_row_idx, dst_local_leaf) in items {
-        let meta = donor
-            .rows
-            .rows
-            .get(src_row_idx)
-            .ok_or_else(corrupt)?
-            .clone();
-        let vec = donor.rows.vector(meta.vec_slot).to_vec();
-        out.push((dst_local_leaf, meta, vec));
-    }
-    Ok(())
 }
 
 impl StageStore {
@@ -471,6 +455,13 @@ impl StageStore {
         matches!(self.inner, StoreBackend::Disk { .. })
     }
 
+    fn has_leaf_plan(&self) -> bool {
+        match &self.inner {
+            StoreBackend::Disk { dir, .. } => dir.join(self.leafkeys_key()).exists(),
+            StoreBackend::Memory(_) => false,
+        }
+    }
+
     fn ids_key(&self, run: u32) -> String {
         format!("ids-e{}-{run:06}.bin", self.epoch)
     }
@@ -485,6 +476,10 @@ impl StageStore {
 
     fn prop_key(&self, round: u8, shard: u32) -> String {
         format!("prop-e{}-r{round}-{shard:06}.bin", self.epoch)
+    }
+
+    fn out_key(&self, round: u8, shard: u32) -> String {
+        format!("out-e{}-r{round}-{shard:06}.bin", self.epoch)
     }
 
     fn leafkeys_key(&self) -> String {
@@ -511,6 +506,7 @@ impl StageStore {
         run: u32,
         manifest: &IndexManifest,
         seg: SegmentIngest,
+        check: &(dyn Fn() -> Result<()> + Sync),
     ) -> Result<()> {
         match &self.inner {
             StoreBackend::Memory(m) => {
@@ -521,13 +517,20 @@ impl StageStore {
             }
             StoreBackend::Disk { dir, quota } => {
                 let ids_slices = encode_id_buckets(&seg.ids_by_bucket)?;
-                write_indexed_slices(&dir.join(self.ids_key(run)), &ids_slices, None, quota)?;
+                write_indexed_slices(
+                    &dir.join(self.ids_key(run)),
+                    &ids_slices,
+                    None,
+                    quota,
+                    check,
+                )?;
                 let (vec_slices, row_counts) = encode_shard_slices(manifest, &seg.rows_by_shard)?;
                 write_indexed_slices(
                     &dir.join(self.vec_key(run)),
                     &vec_slices,
                     Some(&row_counts),
                     quota,
+                    check,
                 )?;
                 Ok(())
             }
@@ -559,7 +562,12 @@ impl StageStore {
         }
     }
 
-    fn put_id_refs(&self, bucket: u32, items: Vec<IdFrameEntry>) -> Result<()> {
+    fn put_id_refs(
+        &self,
+        bucket: u32,
+        items: Vec<IdFrameEntry>,
+        check: &(dyn Fn() -> Result<()> + Sync),
+    ) -> Result<()> {
         match &self.inner {
             StoreBackend::Memory(m) => {
                 lock_mutex(m).id_refs.insert(bucket, items);
@@ -570,6 +578,7 @@ impl StageStore {
                     &dir.join(self.idref_key(bucket)),
                     &encode_id_refs(&items)?,
                     quota,
+                    check,
                 )?;
                 Ok(())
             }
@@ -631,6 +640,10 @@ impl StageStore {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "stores round shard state, centers, and optional location buckets under quota and cancellation"
+    )]
     fn put_shard_state(
         &self,
         round: u8,
@@ -639,6 +652,7 @@ impl StageStore {
         plan: &ShardPlan,
         state: ShardState,
         write_locs: bool,
+        check: &(dyn Fn() -> Result<()> + Sync),
     ) -> Result<()> {
         match &self.inner {
             StoreBackend::Memory(m) => {
@@ -652,7 +666,7 @@ impl StageStore {
                 let loc_path = dir.join(loc_key);
                 let (centers_buf, rest) = encode_shard_state(manifest, plan, &state, write_locs)?;
                 let Some((shard_buf, loc_slices)) = rest else {
-                    write_checksummed_bytes(&c_path, &centers_buf, quota)?;
+                    write_checksummed_bytes(&c_path, &centers_buf, quota, check)?;
                     return Ok(());
                 };
                 let mut total =
@@ -663,10 +677,10 @@ impl StageStore {
                 } else {
                     quota.ensure_headroom(total, &[&s_path, &c_path])?;
                 }
-                write_checksummed_bytes(&s_path, &shard_buf, quota)?;
-                write_checksummed_bytes(&c_path, &centers_buf, quota)?;
+                write_checksummed_bytes(&s_path, &shard_buf, quota, check)?;
+                write_checksummed_bytes(&c_path, &centers_buf, quota, check)?;
                 if let Some(locs) = loc_slices {
-                    write_indexed_slices(&loc_path, &locs, None, quota)?;
+                    write_indexed_slices(&loc_path, &locs, None, quota, check)?;
                 }
                 Ok(())
             }
@@ -679,6 +693,7 @@ impl StageStore {
         s: u32,
         manifest: &IndexManifest,
         plan: &ShardPlan,
+        check: &(dyn Fn() -> Result<()> + Sync),
     ) -> Result<()> {
         let StoreBackend::Disk { dir, quota } = &self.inner else {
             return Ok(());
@@ -689,7 +704,7 @@ impl StageStore {
         }
         let (_, _, loc_key) = self.shard_keys(round, s);
         let loc_slices = encode_shard_locations(plan, &state)?;
-        write_indexed_slices(&dir.join(loc_key), &loc_slices, None, quota)?;
+        write_indexed_slices(&dir.join(loc_key), &loc_slices, None, quota, check)?;
         Ok(())
     }
 
@@ -770,23 +785,84 @@ impl StageStore {
         }
     }
 
-    fn read_donor_rows(
+    fn put_outbound_rows(
         &self,
         round: u8,
         donor_shard: u32,
+        heavy_shards: u32,
         manifest: &IndexManifest,
-        items: &[(usize, u32)],
-        out: &mut Vec<(u32, CompactMeta, Vec<f32>)>,
+        moved_out: &BTreeMap<usize, (u32, u32)>,
+        check: &(dyn Fn() -> Result<()> + Sync),
+    ) -> Result<()> {
+        let has_cross_shard = moved_out
+            .values()
+            .any(|&(dst_shard, _)| dst_shard != donor_shard);
+        if !has_cross_shard {
+            return Ok(());
+        }
+        let donor = self.read_shard_state(round, donor_shard, manifest, false)?;
+        let mut slices: Vec<Vec<DonorRow>> = vec![Vec::new(); heavy_shards as usize];
+        for (&src_row_idx, &(dst_shard, dst_local_leaf)) in moved_out {
+            if dst_shard == donor_shard {
+                continue;
+            }
+            let meta = donor
+                .rows
+                .rows
+                .get(src_row_idx)
+                .ok_or_else(corrupt)?
+                .clone();
+            let vec = donor.rows.vector(meta.vec_slot).to_vec();
+            slices
+                .get_mut(dst_shard as usize)
+                .ok_or_else(corrupt)?
+                .push((dst_local_leaf, meta, vec));
+        }
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                lock_mutex(m).outbound.insert((round, donor_shard), slices);
+                Ok(())
+            }
+            StoreBackend::Disk { dir, quota } => {
+                let (raw_slices, counts) = encode_outbound_slices(manifest, &slices)?;
+                write_indexed_slices(
+                    &dir.join(self.out_key(round, donor_shard)),
+                    &raw_slices,
+                    Some(&counts),
+                    quota,
+                    check,
+                )?;
+                Ok(())
+            }
+        }
+    }
+
+    fn take_outbound_slice(
+        &self,
+        round: u8,
+        donor_shard: u32,
+        dst_shard: u32,
+        manifest: &IndexManifest,
+        out: &mut Vec<DonorRow>,
     ) -> Result<()> {
         match &self.inner {
             StoreBackend::Memory(m) => {
-                let g = lock_mutex(m);
-                let donor = g.shards.get(&(round, donor_shard)).ok_or_else(corrupt)?;
-                extract_donor_rows(donor, items, out)
+                let mut g = lock_mutex(m);
+                let slices = g
+                    .outbound
+                    .get_mut(&(round, donor_shard))
+                    .ok_or_else(corrupt)?;
+                let slot = slices.get_mut(dst_shard as usize).ok_or_else(corrupt)?;
+                out.extend(std::mem::take(slot));
+                Ok(())
             }
-            StoreBackend::Disk { .. } => {
-                let donor = self.read_shard_state(round, donor_shard, manifest, false)?;
-                extract_donor_rows(&donor, items, out)
+            StoreBackend::Disk { dir, .. } => {
+                let path = dir.join(self.out_key(round, donor_shard));
+                if let Some(raw) = read_indexed_slice(&path, dst_shard as usize, MAX_TOTAL_SHARDS)?
+                {
+                    decode_outbound_slice(&raw, manifest, out)?;
+                }
+                Ok(())
             }
         }
     }
@@ -828,7 +904,13 @@ impl StageStore {
         }
     }
 
-    fn put_proposals(&self, round: u8, s: u32, proposals: Vec<MoveProposal>) -> Result<()> {
+    fn put_proposals(
+        &self,
+        round: u8,
+        s: u32,
+        proposals: Vec<MoveProposal>,
+        check: &(dyn Fn() -> Result<()> + Sync),
+    ) -> Result<()> {
         match &self.inner {
             StoreBackend::Memory(m) => {
                 lock_mutex(m).proposals.insert((round, s), proposals);
@@ -839,6 +921,7 @@ impl StageStore {
                     &dir.join(self.prop_key(round, s)),
                     &encode_proposals(&proposals)?,
                     quota,
+                    check,
                 )?;
                 Ok(())
             }
@@ -879,7 +962,12 @@ impl StageStore {
         )?))
     }
 
-    fn save_leaf_plan(&self, leaf_plan: &LeafPlan, tree_buckets: u32) -> Result<()> {
+    fn save_leaf_plan(
+        &self,
+        leaf_plan: &LeafPlan,
+        tree_buckets: u32,
+        check: &(dyn Fn() -> Result<()> + Sync),
+    ) -> Result<()> {
         let StoreBackend::Disk { dir, quota } = &self.inner else {
             return Ok(());
         };
@@ -887,6 +975,7 @@ impl StageStore {
             &dir.join(self.leafkeys_key()),
             &encode_leaf_keys_plan(leaf_plan, tree_buckets)?,
             quota,
+            check,
         )?;
         Ok(())
     }
@@ -910,11 +999,10 @@ impl StageStore {
             let _lock = guard;
             for name in keys {
                 let p = dir.join(name);
-                let len = fs::metadata(&p).map_or(0, |m| m.len());
                 match fs::remove_file(&p) {
-                    Ok(()) => quota.release_path(&p, len),
+                    Ok(()) => quota.release_path(&p),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        quota.release_path(&p, 0);
+                        quota.release_path(&p);
                     }
                     Err(_) => {}
                 }
@@ -968,12 +1056,12 @@ impl StageStore {
         }
     }
 
-    async fn reclaim_proposals<B: Backend>(
+    async fn reclaim_round_proposals<B: Backend>(
         &self,
         env: &StageEnv<B>,
         lock: &Arc<File>,
         round: u8,
-        prop_counts: &[u64],
+        heavy_shards: u32,
     ) -> Result<()> {
         match &self.inner {
             StoreBackend::Memory(m) => {
@@ -981,12 +1069,7 @@ impl StageStore {
                 Ok(())
             }
             StoreBackend::Disk { .. } => {
-                let keys = prop_counts
-                    .iter()
-                    .enumerate()
-                    .filter(|&(_, &c)| c > 0)
-                    .map(|(s, _)| self.prop_key(round, s as u32))
-                    .collect();
+                let keys = (0..heavy_shards).map(|s| self.prop_key(round, s)).collect();
                 self.remove_disk_files(env, lock, keys).await
             }
         }
@@ -1004,13 +1087,14 @@ impl StageStore {
                 let mut g = lock_mutex(m);
                 g.shards.retain(|&(r, _), _| r != round);
                 g.proposals.retain(|&(r, _), _| r != round);
+                g.outbound.retain(|&(r, _), _| r != round);
                 Ok(())
             }
             StoreBackend::Disk { .. } => {
-                let mut obsolete = Vec::with_capacity((heavy_shards as usize) * 3);
+                let mut obsolete = Vec::with_capacity((heavy_shards as usize) * 4);
                 for s in 0..heavy_shards {
                     let (sk, ck, _) = self.shard_keys(round, s);
-                    obsolete.extend([sk, ck, self.prop_key(round, s)]);
+                    obsolete.extend([sk, ck, self.prop_key(round, s), self.out_key(round, s)]);
                 }
                 self.remove_disk_files(env, lock, obsolete).await
             }
@@ -1190,7 +1274,10 @@ pub(crate) async fn run_pipeline<B: Backend>(
     let parallelism = state.options.parallelism.max(1);
     let budget = effective_budget(context.backend().admission_budget(), state.options.load)?;
     let effective_mem = state.options.memory_bytes;
-    let quota = Arc::new(ScratchQuota::new(state.options.scratch_bytes));
+    let quota = Arc::new(ScratchQuota::new(
+        state.options.scratch_bytes,
+        state.options.distributed_workers > 1,
+    ));
     let work_dir = state.directory();
     let hard_limits = state.hard_limits;
     let graph_memory_bytes = state.options.graph_memory_bytes;
@@ -1238,7 +1325,7 @@ pub(crate) async fn run_pipeline<B: Backend>(
                         if effective_mem < row_bytes.saturating_mul(16) {
                             return Err(Error::new(ErrorKind::LimitExceeded));
                         }
-                        ShardPlan::load(&plan_path, &manifest, &check)?
+                        ShardPlan::load(&plan_path, &manifest, snap.manifest().items(), &check)?
                     } else {
                         let built = ShardPlan::build(
                             &snap,
@@ -1247,7 +1334,7 @@ pub(crate) async fn run_pipeline<B: Backend>(
                             effective_mem,
                             &check,
                         )?;
-                        built.save(&plan_path, &quota_c)?;
+                        built.save(&plan_path, &quota_c, &check)?;
                         built
                     }
                 };
@@ -1330,11 +1417,9 @@ pub(crate) async fn run_pipeline<B: Backend>(
     let scatter_units = u32::try_from(seg_count.div_ceil(segs_per_run))
         .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
 
-    let leaf_conc = if in_memory {
-        parallelism
-    } else {
-        (effective_mem / (96 * 1024 * 1024)).clamp(1, parallelism.min(8))
-    };
+    let leaf_conc = (effective_mem / (96 * 1024 * 1024))
+        .clamp(1, parallelism.min(8))
+        .min(coarse_shards.max(1) as usize);
     let emit_conc = if in_memory || state.options.distributed_workers > 1 {
         parallelism.min(8)
     } else {
@@ -1377,7 +1462,7 @@ pub(crate) async fn run_pipeline<B: Backend>(
                     )?;
                     let records = seg.records;
                     let id_lthash = seg.id_lthash;
-                    store_c.put_scatter_run(unit, manifest, seg)?;
+                    store_c.put_scatter_run(unit, manifest, seg, check)?;
                     Ok(UnitOutput {
                         records,
                         aux_lthash: id_lthash,
@@ -1407,7 +1492,7 @@ pub(crate) async fn run_pipeline<B: Backend>(
                     store_c.take_id_bucket(run, b as usize, &mut ids)?;
                 }
                 let (count, hash, sorted) = verify_id_bucket(ids)?;
-                store_c.put_id_refs(b, sorted)?;
+                store_c.put_id_refs(b, sorted, check)?;
                 Ok(UnitOutput {
                     records: count,
                     aux_lthash: hash,
@@ -1430,7 +1515,9 @@ pub(crate) async fn run_pipeline<B: Backend>(
             .await?;
 
         init_stage_units(&env, STAGE_LEAVES, coarse_shards).await?;
-        if !is_stage_complete(&env, STAGE_LEAVES, coarse_shards).await? {
+        if !is_stage_complete(&env, STAGE_LEAVES, coarse_shards).await?
+            && !(env.distributed_workers > 1 && store.has_leaf_plan())
+        {
             let run_sources = {
                 let store_c = Arc::clone(&store);
                 let manifest_c = env.manifest.clone();
@@ -1453,7 +1540,8 @@ pub(crate) async fn run_pipeline<B: Backend>(
                 Ok(v) => Some(Arc::new(v)),
                 Err(_)
                     if env.distributed_workers > 1
-                        && is_stage_complete(&env, STAGE_LEAVES, coarse_shards).await? =>
+                        && (is_stage_complete(&env, STAGE_LEAVES, coarse_shards).await?
+                            || store.has_leaf_plan()) =>
                 {
                     None
                 }
@@ -1505,6 +1593,7 @@ pub(crate) async fn run_pipeline<B: Backend>(
                             &plan_c,
                             shard_state,
                             write_locs,
+                            check,
                         )?;
                         Ok(UnitOutput {
                             records: base_count,
@@ -1540,7 +1629,7 @@ pub(crate) async fn run_pipeline<B: Backend>(
             report.refine = refine_start.elapsed();
         }
 
-        finalize_leaf_plan(
+        let lp = finalize_leaf_plan(
             &env,
             &store,
             &lock,
@@ -1549,7 +1638,13 @@ pub(crate) async fn run_pipeline<B: Backend>(
             &plan,
             tree_buckets,
         )
-        .await?
+        .await?;
+        if refinement_rounds.is_some_and(|rds| lp.final_round < rds) && heavy_shards > 0 {
+            store
+                .reclaim_round_proposals(&env, &lock, lp.final_round, heavy_shards)
+                .await?;
+        }
+        lp
     };
 
     // 5. Emit serving KVs in ascending keyspace order:
@@ -1558,11 +1653,13 @@ pub(crate) async fn run_pipeline<B: Backend>(
     let leaf_partitions: u64 = leaf_plan.trees.iter().map(|t| t.total_leaves).sum();
     let leaf_plan = Arc::new(leaf_plan);
 
-    let max_records_per_subbatch = if in_memory {
-        32_768
-    } else {
-        (effective_mem / 4096).clamp(64, 4096)
-    };
+    let avg_rec_bytes = ((snapshot.manifest().bytes() / snapshot.manifest().items().max(1))
+        as usize)
+        .saturating_add(128)
+        .max(128);
+    let per_emit_worker_mem = effective_mem / emit_conc.max(1);
+    let max_records_per_subbatch =
+        (per_emit_worker_mem / 2 / avg_rec_bytes).clamp(16, if in_memory { 16_384 } else { 4_096 });
     if in_memory {
         let store_c = Arc::clone(&store);
         let lp_c = Arc::clone(&leaf_plan);
@@ -1684,8 +1781,17 @@ pub(crate) async fn run_pipeline<B: Backend>(
         .await?;
 
     // Stage 31: Build and emit Upper Trees + Partition-Local HNSW graphs (`[0x03]` + `[0x04]`).
+    let min_graph_thread_mem = (16 * 1024 * 1024).min(graph_memory_bytes.max(1));
+    let max_graph_concurrency = (graph_memory_bytes / min_graph_thread_mem).clamp(1, parallelism);
+    let tree_conc = max_graph_concurrency
+        .min(4)
+        .min(tree_buckets as usize)
+        .max(1);
+    let graph_threads = (max_graph_concurrency / tree_conc).max(1);
+    let per_thread_graph_mem = (graph_memory_bytes / (tree_conc * graph_threads).max(1)).max(1);
+
     init_stage_units(&env, STAGE_EMIT_TREES, tree_buckets).await?;
-    let tree_emit_done = drive_stage(&env, STAGE_EMIT_TREES, tree_buckets, parallelism.min(4), {
+    let tree_emit_done = drive_stage(&env, STAGE_EMIT_TREES, tree_buckets, tree_conc, {
         let env = env.clone();
         let store_c = Arc::clone(&store);
         let leaf_plan_c = Arc::clone(&leaf_plan);
@@ -1698,31 +1804,24 @@ pub(crate) async fn run_pipeline<B: Backend>(
             let plan_u = plan_c.clone();
             let guard = Arc::clone(&lock);
             async move {
-                let (trees_n, internal_parts, kvs, kv_lt, def_lt, ref_lt) = env_c
+                let mut bucket_trees: Vec<UpperTreeBucket> = env_c
                     .spawn_cpu({
                         let manifest = env_c.manifest.clone();
+                        let guard_load = Arc::clone(&guard);
                         move |ctrl| {
-                            let _lock = guard;
+                            let _lock = guard_load;
                             let check = || crate::runtime::check_control(&ctrl);
-                            let mut bucket_trees: BTreeMap<Bytes, UpperTreeBucket> =
-                                BTreeMap::new();
+                            let mut by_key: BTreeMap<Bytes, UpperTreeBucket> = BTreeMap::new();
                             for t in &lp_c.trees {
                                 if t.tree_bucket == tb {
-                                    bucket_trees.insert(
+                                    by_key.insert(
                                         Bytes::copy_from_slice(t.tree_key.as_bytes()),
                                         (t.tree_key.clone(), t.total_leaves, Vec::new()),
                                     );
                                 }
                             }
-                            if bucket_trees.is_empty() {
-                                return Ok((
-                                    0_u64,
-                                    0_u64,
-                                    Vec::new(),
-                                    LtHash::ZERO,
-                                    LtHash::ZERO,
-                                    LtHash::ZERO,
-                                ));
+                            if by_key.is_empty() {
+                                return Ok(Vec::new());
                             }
                             for (s, shard_keys) in lp_c.assigned.iter().enumerate() {
                                 if !shard_keys.iter().any(|ak| {
@@ -1742,7 +1841,7 @@ pub(crate) async fn run_pipeline<B: Backend>(
                                     if !ak.is_single_leaf_root
                                         && lp_c.trees[ak.tree_id as usize].tree_bucket == tb
                                     {
-                                        bucket_trees
+                                        by_key
                                             .get_mut(tk.as_bytes())
                                             .ok_or_else(corrupt)?
                                             .2
@@ -1750,51 +1849,158 @@ pub(crate) async fn run_pipeline<B: Backend>(
                                     }
                                 }
                             }
-                            for (_, total_l, children) in bucket_trees.values() {
+                            for (_, total_l, children) in by_key.values() {
                                 if *total_l > 1 && children.len() as u64 != *total_l {
                                     return Err(corrupt());
                                 }
                             }
-
-                            let mut all_kvs = Vec::new();
-                            let mut kv_lt = LtHash::ZERO;
-                            let mut def_lt = LtHash::ZERO;
-                            let mut ref_lt = LtHash::ZERO;
-                            let mut internal_parts = 0_u64;
-                            let trees_n = bucket_trees.len() as u64;
-                            let graph_threads = if in_memory {
-                                parallelism
-                            } else {
-                                (parallelism / 2).max(1)
-                            };
-                            for (_, (tk, total_l, children)) in bucket_trees {
-                                let enc = build_and_encode_upper_tree(
-                                    &manifest,
-                                    &tk,
-                                    total_l,
-                                    children,
-                                    sample_items,
-                                    graph_memory_bytes,
-                                    hard_limits,
-                                    graph_threads,
-                                    &check,
-                                )?;
-                                internal_parts += enc.partitions;
-                                kv_lt.add_assign(enc.kv_lthash);
-                                def_lt.add_assign(enc.edge_def_lthash);
-                                ref_lt.add_assign(enc.edge_ref_lthash);
-                                all_kvs.extend(enc.kvs);
-                            }
-                            all_kvs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                            Ok((trees_n, internal_parts, all_kvs, kv_lt, def_lt, ref_lt))
+                            Ok(by_key.into_values().collect())
                         }
                     })
                     .await?;
-                let kv_count = kvs.len() as u64;
-                env_c.commit_unit_kvs(u_lease.as_ref(), kvs).await?;
+
+                if bucket_trees.is_empty() {
+                    return Ok(UnitOutput::default());
+                }
+
+                let trees_n = bucket_trees.len() as u64;
+                let mut total_kv_count = 0_u64;
+                let mut internal_parts = 0_u64;
+                let mut kv_lt = LtHash::ZERO;
+                let mut def_lt = LtHash::ZERO;
+                let mut ref_lt = LtHash::ZERO;
+
+                while !bucket_trees.is_empty() {
+                    let mut wave_leaves = 0_u64;
+                    let mut take_trees = 0_usize;
+                    for (_, total_l, _) in &bucket_trees {
+                        if take_trees > 0 && (take_trees >= 512 || wave_leaves + total_l > 4_096) {
+                            break;
+                        }
+                        wave_leaves = wave_leaves.saturating_add(*total_l);
+                        take_trees += 1;
+                    }
+                    let mut wave: Vec<UpperTreeBucket> = bucket_trees.drain(..take_trees).collect();
+
+                    if wave.len() == 1 && wave[0].1 > 8_192 {
+                        let (tk, total_l, children) = wave.pop().expect("single large tree");
+                        let manifest_p = env_c.manifest.clone();
+                        let guard_p = Arc::clone(&guard);
+                        let tk_p = tk.clone();
+                        let planned = env_c
+                            .spawn_cpu(move |ctrl| {
+                                let _lock = guard_p;
+                                let check = || crate::runtime::check_control(&ctrl);
+                                plan_upper_tree(
+                                    &manifest_p,
+                                    &tk_p,
+                                    total_l,
+                                    children,
+                                    sample_items,
+                                    hard_limits,
+                                    &check,
+                                )
+                            })
+                            .await?;
+
+                        kv_lt.add_assign(LtHash::from_kv(
+                            &planned.tree_manifest_kv.0,
+                            &planned.tree_manifest_kv.1,
+                        ));
+                        total_kv_count += 1;
+                        env_c
+                            .commit_unit_kvs(u_lease.as_ref(), vec![planned.tree_manifest_kv])
+                            .await?;
+
+                        let mut nodes = planned.internal_nodes;
+                        while !nodes.is_empty() {
+                            let n_take = nodes.len().min(64);
+                            let node_batch: Vec<_> = nodes.drain(..n_take).collect();
+                            let manifest_e = env_c.manifest.clone();
+                            let guard_e = Arc::clone(&guard);
+                            let tk_e = tk.clone();
+                            let enc = env_c
+                                .spawn_cpu(move |ctrl| {
+                                    let _lock = guard_e;
+                                    let check = || crate::runtime::check_control(&ctrl);
+                                    encode_upper_tree_nodes(
+                                        &manifest_e,
+                                        &tk_e,
+                                        &node_batch,
+                                        per_thread_graph_mem,
+                                        hard_limits,
+                                        graph_threads,
+                                        &check,
+                                    )
+                                })
+                                .await?;
+                            internal_parts += enc.partitions;
+                            total_kv_count += enc.kvs.len() as u64;
+                            kv_lt.add_assign(enc.kv_lthash);
+                            def_lt.add_assign(enc.edge_def_lthash);
+                            ref_lt.add_assign(enc.edge_ref_lthash);
+                            env_c.commit_unit_kvs(u_lease.as_ref(), enc.kvs).await?;
+                        }
+                    } else {
+                        let manifest_w = env_c.manifest.clone();
+                        let guard_w = Arc::clone(&guard);
+                        let (w_parts, w_kvs, w_kv_lt, w_def_lt, w_ref_lt) = env_c
+                            .spawn_cpu(move |ctrl| {
+                                let _lock = guard_w;
+                                let check = || crate::runtime::check_control(&ctrl);
+                                let mut kvs = Vec::new();
+                                let mut w_kv = LtHash::ZERO;
+                                let mut w_def = LtHash::ZERO;
+                                let mut w_ref = LtHash::ZERO;
+                                let mut w_p = 0_u64;
+                                for (tk, total_l, children) in wave {
+                                    let planned = plan_upper_tree(
+                                        &manifest_w,
+                                        &tk,
+                                        total_l,
+                                        children,
+                                        sample_items,
+                                        hard_limits,
+                                        &check,
+                                    )?;
+                                    w_kv.add_assign(LtHash::from_kv(
+                                        &planned.tree_manifest_kv.0,
+                                        &planned.tree_manifest_kv.1,
+                                    ));
+                                    kvs.push(planned.tree_manifest_kv);
+                                    if !planned.internal_nodes.is_empty() {
+                                        let enc = encode_upper_tree_nodes(
+                                            &manifest_w,
+                                            &tk,
+                                            &planned.internal_nodes,
+                                            per_thread_graph_mem,
+                                            hard_limits,
+                                            graph_threads,
+                                            &check,
+                                        )?;
+                                        w_p += enc.partitions;
+                                        w_kv.add_assign(enc.kv_lthash);
+                                        w_def.add_assign(enc.edge_def_lthash);
+                                        w_ref.add_assign(enc.edge_ref_lthash);
+                                        kvs.extend(enc.kvs);
+                                    }
+                                }
+                                kvs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                                Ok((w_p, kvs, w_kv, w_def, w_ref))
+                            })
+                            .await?;
+                        internal_parts += w_parts;
+                        total_kv_count += w_kvs.len() as u64;
+                        kv_lt.add_assign(w_kv_lt);
+                        def_lt.add_assign(w_def_lt);
+                        ref_lt.add_assign(w_ref_lt);
+                        env_c.commit_unit_kvs(u_lease.as_ref(), w_kvs).await?;
+                    }
+                }
+
                 Ok(UnitOutput {
                     records: trees_n,
-                    kv_count,
+                    kv_count: total_kv_count,
                     aux_count: internal_parts,
                     kv_lthash: kv_lt,
                     aux_lthash: def_lt,
@@ -1966,7 +2172,7 @@ async fn finalize_leaf_plan<B: Backend>(
                 assigned,
                 trees,
             };
-            store_c.save_leaf_plan(&leaf_plan, tree_buckets)?;
+            store_c.save_leaf_plan(&leaf_plan, tree_buckets, &check)?;
             Ok(leaf_plan)
         })
         .await;
@@ -2050,51 +2256,31 @@ async fn run_halo_refinement<B: Backend>(
     parallelism: usize,
     leaf_conc: usize,
 ) -> Result<u8> {
-    let heavy_shards = plan.light_shard_start;
     let per_leaf = refinement_per_leaf_bytes(env.manifest.config().dimension(), rounds);
-    let halo_conc = if !store.is_disk() {
-        parallelism
-    } else {
-        (effective_mem / (192 * 1024 * 1024)).clamp(1, parallelism)
-    };
-    let per_worker_budget = effective_mem / halo_conc.max(1);
-    let admitted_leaves =
-        (effective_mem / per_leaf.max(1)).max(per_worker_budget / per_leaf.max(1));
-    if admitted_leaves < 2 {
+    if effective_mem < per_leaf.saturating_mul(2) {
         return Err(Error::new(ErrorKind::LimitExceeded));
     }
-    let max_halo_leaves = (effective_mem / per_leaf.max(1)).min(MAX_HALO_LEAVES_CAP);
-
-    if rounds == 0 && env.distributed_workers == 1 {
-        let store_c = Arc::clone(store);
-        let plan_c = plan.clone();
-        let manifest_c = env.manifest.clone();
-        let guard = Arc::clone(lock);
-        env.spawn_cpu(move |_ctrl| {
-            let _lock = guard;
-            for heavy in &plan_c.heavy_trees {
-                let mut total_leaves = 0_usize;
-                for s in heavy.shard_start..heavy.shard_start + heavy.shard_count {
-                    total_leaves += store_c.read_shard_centers(0, s, &manifest_c)?.len();
-                }
-                let needed = total_leaves
-                    .min(max_halo_leaves)
-                    .checked_mul(per_leaf)
-                    .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-                if needed > effective_mem {
-                    return Err(Error::new(ErrorKind::LimitExceeded));
-                }
-            }
-            Ok(())
-        })
-        .await?;
+    if rounds == 0 {
         return Ok(0);
     }
 
+    let heavy_shards = plan.light_shard_start;
+    let halo_unit_budget = (effective_mem / 2)
+        .max(per_leaf.saturating_mul(2))
+        .min(effective_mem);
+    let max_halo_leaves = (halo_unit_budget / per_leaf.max(1)).min(MAX_HALO_LEAVES_CAP);
+    let halo_conc = (effective_mem / halo_unit_budget.max(1))
+        .clamp(1, parallelism.min(8))
+        .min(heavy_shards.max(1) as usize);
+
     let mut final_round = 0_u8;
     for r in 0..rounds {
-        let stage_prop = STAGE_REFINE_BASE + 2 * r;
-        let stage_app = STAGE_REFINE_BASE + 2 * r + 1;
+        if env.distributed_workers > 1 && store.has_leaf_plan() {
+            return Ok(final_round);
+        }
+        let stage_prop = STAGE_REFINE_BASE + 3 * r;
+        let stage_ext = STAGE_REFINE_BASE + 3 * r + 1;
+        let stage_app = STAGE_REFINE_BASE + 3 * r + 2;
 
         let prop_done = drive_cpu_stage(env, lock, stage_prop, heavy_shards, halo_conc, {
             let store_c = Arc::clone(store);
@@ -2109,7 +2295,7 @@ async fn run_halo_refinement<B: Backend>(
                     &src_state,
                     max_halo_leaves,
                     per_leaf,
-                    per_worker_budget.max(per_leaf.saturating_mul(2)),
+                    halo_unit_budget,
                     check,
                     |nbr| {
                         if nbr == s {
@@ -2128,7 +2314,7 @@ async fn run_halo_refinement<B: Backend>(
                 )?;
                 let aux_count = proposals.len() as u64;
                 if !proposals.is_empty() {
-                    store_c.put_proposals(r, s, proposals)?;
+                    store_c.put_proposals(r, s, proposals, check)?;
                 }
                 Ok(UnitOutput {
                     aux_count,
@@ -2179,12 +2365,27 @@ async fn run_halo_refinement<B: Backend>(
                 final_round = r + 1;
                 continue;
             }
+            Err(_) if env.distributed_workers > 1 && store.has_leaf_plan() => {
+                return Ok(r);
+            }
             Err(e) => return Err(e),
         };
 
         if accepted_moves.total_accepted == 0 {
-            store.reclaim_proposals(env, lock, r, &prop_counts).await?;
             break;
+        }
+
+        if accepted_moves.has_cross_shard {
+            drive_cpu_stage(env, lock, stage_ext, heavy_shards, leaf_conc, {
+                let store_c = Arc::clone(store);
+                let acc = Arc::clone(&accepted_moves);
+                move |s, manifest, check| {
+                    let moved_out = acc.outbound.get(s as usize).ok_or_else(corrupt)?;
+                    store_c.put_outbound_rows(r, s, heavy_shards, manifest, moved_out, check)?;
+                    Ok(UnitOutput::default())
+                }
+            })
+            .await?;
         }
 
         let write_locs = r + 1 == rounds;
@@ -2202,12 +2403,16 @@ async fn run_halo_refinement<B: Backend>(
         store.reclaim_round(env, lock, r, heavy_shards).await?;
         final_round = r + 1;
     }
-    if store.is_disk() && rounds > 0 && final_round < rounds {
+    if store.is_disk()
+        && rounds > 0
+        && final_round < rounds
+        && !(env.distributed_workers > 1 && store.has_leaf_plan())
+    {
         drive_cpu_stage(env, lock, STAGE_EMIT_LOCS, heavy_shards, leaf_conc, {
             let store_c = Arc::clone(store);
             let plan_c = plan.clone();
-            move |s, manifest, _check| {
-                store_c.write_shard_locations(final_round, s, manifest, &plan_c)?;
+            move |s, manifest, check| {
+                store_c.write_shard_locations(final_round, s, manifest, &plan_c, check)?;
                 Ok(UnitOutput::default())
             }
         })
@@ -2218,8 +2423,9 @@ async fn run_halo_refinement<B: Backend>(
 
 struct AcceptedRoundMoves {
     total_accepted: usize,
+    has_cross_shard: bool,
     outbound: Vec<BTreeMap<usize, (u32, u32)>>,
-    inbound_by_dst: Vec<BTreeMap<u32, Vec<(usize, u32)>>>,
+    inbound_donors_by_dst: Vec<BTreeSet<u32>>,
 }
 
 fn arbitrate_round(
@@ -2233,9 +2439,9 @@ fn arbitrate_round(
 ) -> Result<AcceptedRoundMoves> {
     let heavy_shards = plan.light_shard_start as usize;
     let mut outbound = vec![BTreeMap::new(); heavy_shards];
-    let mut inbound_by_dst: Vec<BTreeMap<u32, Vec<(usize, u32)>>> =
-        vec![BTreeMap::new(); heavy_shards];
+    let mut inbound_donors_by_dst: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); heavy_shards];
     let mut total_accepted = 0_usize;
+    let mut has_cross_shard = false;
     let min_leaf = manifest.config().min_leaf_partition_entries() as usize;
     let max_leaf = manifest.config().max_leaf_partition_entries() as usize;
 
@@ -2269,7 +2475,7 @@ fn arbitrate_round(
                 used_mem = used_mem.saturating_add(shard_props.len().saturating_mul(96));
                 proposals.extend(shard_props);
             }
-            if store.is_disk() && used_mem > memory_budget_bytes.max(64 * 1024) {
+            if used_mem > memory_budget_bytes.max(64 * 1024) {
                 return Err(Error::new(ErrorKind::LimitExceeded));
             }
         }
@@ -2294,19 +2500,19 @@ fn arbitrate_round(
                 return Err(corrupt());
             }
             if p.src_shard != p.dst_shard {
-                inbound_by_dst
+                has_cross_shard = true;
+                inbound_donors_by_dst
                     .get_mut(dst_idx)
                     .ok_or_else(corrupt)?
-                    .entry(p.src_shard)
-                    .or_default()
-                    .push((p.src_row_idx as usize, p.dst_local_leaf));
+                    .insert(p.src_shard);
             }
         }
     }
     Ok(AcceptedRoundMoves {
         total_accepted,
+        has_cross_shard,
         outbound,
-        inbound_by_dst,
+        inbound_donors_by_dst,
     })
 }
 
@@ -2327,26 +2533,73 @@ fn apply_round_shard(
     check()?;
     let moved_out = acc.outbound.get(shard_id as usize).ok_or_else(corrupt)?;
     let donors = acc
-        .inbound_by_dst
+        .inbound_donors_by_dst
         .get(shard_id as usize)
         .ok_or_else(corrupt)?;
 
-    let mut shard = store.read_shard_state(round, shard_id, manifest, false)?;
+    let mut shard = store.read_shard_state(round, shard_id, manifest, true)?;
     if !moved_out.is_empty() || !donors.is_empty() {
         let kernel = kernel_for(manifest)?;
         let mut moved_in = Vec::new();
-        for (&donor_s, items) in donors {
+        for &donor_s in donors {
             check()?;
-            store.read_donor_rows(round, donor_s, manifest, items, &mut moved_in)?;
+            store.take_outbound_slice(round, donor_s, shard_id, manifest, &mut moved_in)?;
         }
         apply_moves_to_shard(&kernel, shard_id, &mut shard, moved_out, moved_in)?;
     }
-    store.put_shard_state(round + 1, shard_id, manifest, plan, shard, write_locs)
+    store.put_shard_state(
+        round + 1,
+        shard_id,
+        manifest,
+        plan,
+        shard,
+        write_locs,
+        check,
+    )
 }
 
 // ============================================================================
 // Collaborative `BuildUnit` Leasing & Progress Coordination
 // ============================================================================
+
+async fn open_stage_read_txn<B: Backend>(
+    env: &StageEnv<B>,
+) -> Result<ReadLogicalTxn<'static, B::ReadTxn<'_>>> {
+    let id = env.manifest.logical_index_id();
+    let mut rtxn = ReadLogicalTxn::bootstrap(env.backend.begin_read().await?);
+    let fetched = rtxn
+        .batch_get(vec![
+            LogicalKey::Manifest(id),
+            LogicalKey::BuildWorkspace(id),
+        ])
+        .await?;
+    if fetched.len() != 2 {
+        return Err(Error::new(ErrorKind::Backend));
+    }
+    check_manifest_building_in_flight(fetched[0].as_ref(), &env.manifest)?;
+    match &fetched[1] {
+        Some(PersistentValue::BuildWorkspace(w)) => {
+            if let Some(kind) = w.failure {
+                return Err(Error::new(kind));
+            }
+            match env.fence {
+                StageFence::Write(wf) => {
+                    if w.epoch != wf.epoch || w.writer_token != wf.owner || wf.owner == [0; 32] {
+                        return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+                    }
+                }
+                StageFence::Validate { ws_token, epoch } => {
+                    if w.token != ws_token || w.epoch != epoch || w.writer_token != [0; 32] {
+                        return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+                    }
+                }
+            }
+        }
+        None => return Err(Error::new(ErrorKind::BulkBuildSuperseded)),
+        _ => return Err(corrupt()),
+    }
+    Ok(rtxn)
+}
 
 async fn is_stage_complete<B: Backend>(
     env: &StageEnv<B>,
@@ -2363,13 +2616,17 @@ async fn is_stage_complete<B: Backend>(
     let epoch = env.fence.epoch();
     let range = LogicalRange::build_units(id, stage);
     retry_read(&env.control, env.fence.operation(), env.retry, || {
-        let backend = Arc::clone(&env.backend);
         let range_ref = &range;
         async move {
-            let mut rtxn = ReadLogicalTxn::bootstrap(backend.begin_read().await?);
+            let mut rtxn = open_stage_read_txn(env).await?;
             let mut cursor = None;
             let mut seen_complete = 0_u32;
+            let mut pages_on_txn = 0_usize;
             loop {
+                if pages_on_txn >= 8 {
+                    rtxn = open_stage_read_txn(env).await?;
+                    pages_on_txn = 0;
+                }
                 let page = rtxn
                     .scan(
                         range_ref,
@@ -2380,11 +2637,15 @@ async fn is_stage_complete<B: Backend>(
                         },
                     )
                     .await?;
+                pages_on_txn += 1;
                 for item in page.items() {
                     let PersistentValue::BuildUnit(u) = item.value() else {
                         return Err(corrupt());
                     };
-                    if u.epoch != epoch || !u.complete {
+                    if u.epoch != epoch {
+                        return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+                    }
+                    if !u.complete {
                         return Ok(false);
                     }
                     seen_complete += 1;
@@ -2414,9 +2675,18 @@ pub(crate) async fn init_stage_units<B: Backend>(
     let id = env.manifest.logical_index_id();
     let epoch = env.fence.epoch();
     let op = env.fence.operation();
-    let max_per_txn = env.budget.max_mutations.saturating_sub(4).clamp(1, 512) as u32;
-    for batch_start in (0..unit_count).step_by(max_per_txn as usize) {
-        let batch_end = (batch_start + max_per_txn).min(unit_count);
+
+    let unit_mut_bytes = BUILD_UNIT_MUTATION_BYTES
+        .checked_add(env.budget.mutation_key_overhead_bytes)
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+    let max_by_bytes = env.budget.max_mutation_bytes / unit_mut_bytes.max(1);
+    let max_by_muts = env.budget.max_mutations;
+    if max_by_bytes == 0 || max_by_muts == 0 {
+        return Err(Error::new(ErrorKind::LimitExceeded));
+    }
+    let max_per_txn = max_by_muts.min(max_by_bytes).clamp(1, 512) as u32;
+
+    if matches!(env.fence, StageFence::Write(_)) && stage >= STAGE_EMIT_RECORDS {
         retry_raw_write(
             &env.control,
             env.sched_lease_lock.as_deref(),
@@ -2424,28 +2694,11 @@ pub(crate) async fn init_stage_units<B: Backend>(
             env.retry,
             || async {
                 let prepared = async {
-                    let mut extra = Vec::with_capacity((batch_end - batch_start + 1) as usize);
-                    if batch_start == 0
-                        && matches!(env.fence, StageFence::Write(_))
-                        && stage >= STAGE_EMIT_RECORDS
-                    {
-                        extra.push(LogicalKey::BuildProgress(id));
-                    }
-                    for u in batch_start..batch_end {
-                        extra.push(LogicalKey::BuildUnit {
-                            index: id,
-                            stage,
-                            unit: u,
-                        });
-                    }
-                    let mut txn = env.begin_fenced_txn(None, extra).await?;
-
-                    let mut any_written = false;
-                    if batch_start == 0
-                        && matches!(env.fence, StageFence::Write(_))
-                        && stage >= STAGE_EMIT_RECORDS
-                        && let Some(PersistentValue::BuildProgress(mut p)) =
-                            txn.get_for_update(LogicalKey::BuildProgress(id)).await?
+                    let mut txn = env
+                        .begin_fenced_txn(None, std::iter::once(LogicalKey::BuildProgress(id)))
+                        .await?;
+                    if let Some(PersistentValue::BuildProgress(mut p)) =
+                        txn.get_for_update(LogicalKey::BuildProgress(id)).await?
                         && p.epoch == epoch
                         && p.phase == BuildPhase::Preparing
                     {
@@ -2455,8 +2708,34 @@ pub(crate) async fn init_stage_units<B: Backend>(
                             PersistentValue::BuildProgress(p),
                         )
                         .await?;
-                        any_written = true;
+                        return Ok::<_, Error>((Some(txn), ()));
                     }
+                    txn.rollback().await;
+                    Ok((None, ()))
+                }
+                .await;
+                commit_raw_prepared(prepared).await
+            },
+        )
+        .await?;
+    }
+
+    for batch_start in (0..unit_count).step_by(max_per_txn as usize) {
+        let batch_end = (batch_start + max_per_txn).min(unit_count);
+        retry_raw_write(
+            &env.control,
+            env.sched_lease_lock.as_deref(),
+            op,
+            env.retry,
+            || async {
+                let prepared = async {
+                    let extra = (batch_start..batch_end).map(|u| LogicalKey::BuildUnit {
+                        index: id,
+                        stage,
+                        unit: u,
+                    });
+                    let mut txn = env.begin_fenced_txn(None, extra).await?;
+                    let mut any_written = false;
                     for u in batch_start..batch_end {
                         let ukey = LogicalKey::BuildUnit {
                             index: id,
@@ -2577,13 +2856,18 @@ where
         return Ok(results.into_iter().map(|(_, bu)| bu).collect());
     }
 
-    let mut known_complete = BTreeSet::<u32>::new();
+    let mut completed: Vec<Option<BuildUnit>> = vec![None; unit_count as usize];
+    let mut prefix_done = 0_u32;
+    let wave_cap = (worker_conc * 4).max(8);
     loop {
         crate::runtime::check_control(&env.control)?;
-        let (claimable, completed_all) =
-            scan_stage_status(env, stage, unit_count, &mut known_complete).await?;
-        if let Some(done) = completed_all {
-            return Ok(done);
+        let claimable =
+            scan_stage_status(env, stage, unit_count, &mut prefix_done, &mut completed).await?;
+        if prefix_done == unit_count {
+            return completed
+                .into_iter()
+                .map(|u| u.ok_or_else(corrupt))
+                .collect();
         }
         if claimable.is_empty() {
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -2593,9 +2877,13 @@ where
         let mut jitter = [0_u8; 4];
         let _ = getrandom::fill(&mut jitter);
         let offset = (u32::from_le_bytes(jitter) as usize) % claimable.len();
-        let mut ordered = Vec::with_capacity(claimable.len());
-        ordered.extend_from_slice(&claimable[offset..]);
-        ordered.extend_from_slice(&claimable[..offset]);
+        let mut ordered = Vec::with_capacity(claimable.len().min(wave_cap));
+        for &u in claimable[offset..].iter().chain(&claimable[..offset]) {
+            ordered.push(u);
+            if ordered.len() == wave_cap {
+                break;
+            }
+        }
 
         let claimable_len = ordered.len();
         let queue = Arc::new(Mutex::new(ordered.into_iter()));
@@ -2661,10 +2949,12 @@ async fn read_completed_unit<B: Backend>(
 ) -> Result<Option<BuildUnit>> {
     let id = env.manifest.logical_index_id();
     let epoch = env.fence.epoch();
-    retry_read(&env.control, env.fence.operation(), env.retry, || {
-        let backend = Arc::clone(&env.backend);
-        async move {
-            let mut rtxn = ReadLogicalTxn::bootstrap(backend.begin_read().await?);
+    retry_read(
+        &env.control,
+        env.fence.operation(),
+        env.retry,
+        || async move {
+            let mut rtxn = open_stage_read_txn(env).await?;
             match rtxn
                 .get(LogicalKey::BuildUnit {
                     index: id,
@@ -2678,8 +2968,8 @@ async fn read_completed_unit<B: Backend>(
                 }
                 _ => Ok(None),
             }
-        }
-    })
+        },
+    )
     .await
 }
 
@@ -2716,86 +3006,88 @@ async fn scan_stage_status<B: Backend>(
     env: &StageEnv<B>,
     stage: u8,
     unit_count: u32,
-    known_complete: &mut BTreeSet<u32>,
-) -> Result<(Vec<u32>, Option<Vec<BuildUnit>>)> {
+    prefix_done: &mut u32,
+    completed: &mut [Option<BuildUnit>],
+) -> Result<Vec<u32>> {
     let id = env.manifest.logical_index_id();
     let epoch = env.fence.epoch();
-    let range = LogicalRange::build_units(id, stage);
-    retry_read(&env.control, env.fence.operation(), env.retry, || {
-        let range_ref = &range;
-        let mut seen = known_complete.clone();
-        async move {
-            let now = now_ms()?;
-            let mut rtxn = ReadLogicalTxn::bootstrap(env.backend.begin_read().await?);
-            check_manifest_building_in_flight(
-                rtxn.get(LogicalKey::Manifest(id)).await?.as_ref(),
-                &env.manifest,
-            )?;
-            if let Some(PersistentValue::BuildWorkspace(w)) =
-                rtxn.get(LogicalKey::BuildWorkspace(id)).await?
-                && let Some(kind) = w.failure
-            {
-                return Err(Error::new(kind));
+    let from_unit = *prefix_done;
+    if from_unit >= unit_count {
+        return Ok(Vec::new());
+    }
+    let expected_tail = (unit_count - from_unit) as usize;
+    let range = LogicalRange::build_units_from(id, stage, from_unit);
+    let (newly_done, claimable) =
+        retry_read(&env.control, env.fence.operation(), env.retry, || {
+            let range_ref = &range;
+            async move {
+                let now = now_ms()?;
+                let mut rtxn = open_stage_read_txn(env).await?;
+                let mut cursor = None;
+                let mut seen_tail = 0_usize;
+                let mut newly_done: Vec<(u32, BuildUnit)> = Vec::new();
+                let mut claimable = Vec::new();
+                let mut pages_on_txn = 0_usize;
+                loop {
+                    if pages_on_txn >= 8 {
+                        rtxn = open_stage_read_txn(env).await?;
+                        pages_on_txn = 0;
+                    }
+                    let page = rtxn
+                        .scan(
+                            range_ref,
+                            cursor.as_ref(),
+                            ScanLimits {
+                                item_limit: 1024,
+                                byte_limit: 512 * 1024,
+                            },
+                        )
+                        .await?;
+                    pages_on_txn += 1;
+                    for item in page.items() {
+                        let LogicalKey::BuildUnit { unit, .. } = *item.key() else {
+                            return Err(corrupt());
+                        };
+                        if unit != from_unit + seen_tail as u32 {
+                            return Err(corrupt());
+                        }
+                        let PersistentValue::BuildUnit(u) = item.value().clone() else {
+                            return Err(corrupt());
+                        };
+                        if u.epoch != epoch {
+                            return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+                        }
+                        seen_tail += 1;
+                        if u.complete {
+                            newly_done.push((unit, u));
+                        } else if u.owner == [0; 32] || u.expires_ms <= now {
+                            claimable.push(unit);
+                        }
+                    }
+                    cursor = page.into_next_cursor();
+                    if cursor.is_none() {
+                        break;
+                    }
+                }
+                if seen_tail != expected_tail {
+                    return Err(corrupt());
+                }
+                Ok((newly_done, claimable))
             }
+        })
+        .await?;
 
-            let mut cursor = None;
-            let mut units = Vec::with_capacity(unit_count as usize);
-            let mut claimable = Vec::new();
-            let mut pages_on_txn = 0_usize;
-            loop {
-                if pages_on_txn >= 8 {
-                    rtxn = ReadLogicalTxn::bootstrap(env.backend.begin_read().await?);
-                    pages_on_txn = 0;
-                }
-                let page = rtxn
-                    .scan(
-                        range_ref,
-                        cursor.as_ref(),
-                        ScanLimits {
-                            item_limit: 1024,
-                            byte_limit: 512 * 1024,
-                        },
-                    )
-                    .await?;
-                pages_on_txn += 1;
-                for item in page.items() {
-                    let LogicalKey::BuildUnit { unit, .. } = *item.key() else {
-                        return Err(corrupt());
-                    };
-                    let PersistentValue::BuildUnit(u) = item.value().clone() else {
-                        return Err(corrupt());
-                    };
-                    if u.epoch != epoch {
-                        return Err(Error::new(ErrorKind::BulkBuildSuperseded));
-                    }
-                    if u.complete {
-                        seen.insert(unit);
-                    } else if u.owner == [0; 32] || u.expires_ms <= now {
-                        claimable.push(unit);
-                    }
-                    units.push(u);
-                }
-                cursor = page.into_next_cursor();
-                if cursor.is_none() {
-                    break;
-                }
-            }
-            if units.len() != unit_count as usize {
-                return Err(corrupt());
-            }
-            let done = if seen.len() == unit_count as usize && units.iter().all(|u| u.complete) {
-                Some(units)
-            } else {
-                None
-            };
-            Ok((seen, claimable, done))
+    for (unit, bu) in newly_done {
+        if let Some(slot) = completed.get_mut(unit as usize)
+            && slot.is_none()
+        {
+            *slot = Some(bu);
         }
-    })
-    .await
-    .map(|(seen, claimable, done)| {
-        *known_complete = seen;
-        (claimable, done)
-    })
+    }
+    while (*prefix_done as usize) < completed.len() && completed[*prefix_done as usize].is_some() {
+        *prefix_done += 1;
+    }
+    Ok(claimable)
 }
 
 async fn try_claim_unit<B: Backend>(
@@ -2988,9 +3280,9 @@ async fn complete_unit<B: Backend>(
         || async {
             let _lease_guard = lease.lock.lock().await;
             let prepared = async {
-                let extra = (matches!(env.fence, StageFence::Write(_)) && out.kv_count > 0)
-                    .then_some(LogicalKey::BuildProgress(id));
-                let mut txn = env.begin_fenced_txn(Some(ukey.clone()), extra).await?;
+                let mut txn = env
+                    .begin_fenced_txn(Some(ukey.clone()), std::iter::empty())
+                    .await?;
 
                 match txn.get_for_update(ukey.clone()).await? {
                     Some(PersistentValue::BuildUnit(u)) if u.epoch == epoch && u.complete => {
@@ -3011,25 +3303,6 @@ async fn complete_unit<B: Backend>(
                         return Err(Error::new(ErrorKind::BulkBuildSuperseded));
                     }
                     _ => return Err(corrupt()),
-                }
-
-                if matches!(env.fence, StageFence::Write(_))
-                    && out.kv_count > 0
-                    && let Some(PersistentValue::BuildProgress(mut p)) =
-                        txn.get_for_update(LogicalKey::BuildProgress(id)).await?
-                    && p.epoch == epoch
-                    && matches!(p.phase, BuildPhase::Preparing | BuildPhase::Loading)
-                {
-                    p.phase = BuildPhase::Loading;
-                    p.loaded_entries = p.loaded_entries.saturating_add(out.kv_count);
-                    if p.loaded_entries > p.total_entries {
-                        p.total_entries = p.loaded_entries;
-                    }
-                    txn.put(
-                        LogicalKey::BuildProgress(id),
-                        PersistentValue::BuildProgress(p),
-                    )
-                    .await?;
                 }
                 Ok((Some(txn), ()))
             }

@@ -1,8 +1,7 @@
 //! Segmented finite source snapshots preserving complete records before index allocation.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
@@ -24,7 +23,7 @@ pub struct InputSnapshot {
     config: IndexConfig,
     manifest: InputManifest,
     segments: Arc<[SegmentMeta]>,
-    verified_segments: Arc<[AtomicBool]>,
+    verified_segments: Arc<[Mutex<bool>]>,
 }
 
 impl InputSnapshot {
@@ -35,7 +34,7 @@ impl InputSnapshot {
         segments: Vec<SegmentMeta>,
     ) -> Self {
         let verified_segments = (0..segments.len())
-            .map(|_| AtomicBool::new(false))
+            .map(|_| Mutex::new(false))
             .collect::<Vec<_>>()
             .into();
         Self {

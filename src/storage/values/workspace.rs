@@ -120,12 +120,11 @@ pub(super) fn encode_options(e: &mut Encoder, o: &BulkWorkerOptions) -> Result<(
             .as_bytes(),
         3900,
     )?;
-    let lease_ms =
-        u64::try_from(o.unit_lease.as_millis()).map_err(|_| Error::invalid_argument())?;
+    e.u64(o.parallelism as u64);
+    e.u64(o.distributed_workers as u64);
+    e.u64(o.unit_lease.as_secs());
+    e.u32(o.unit_lease.subsec_nanos());
     for n in [
-        o.parallelism as u64,
-        o.distributed_workers as u64,
-        lease_ms,
         o.memory_bytes as u64,
         o.graph_memory_bytes as u64,
         o.scratch_bytes,
@@ -140,11 +139,18 @@ pub(super) fn encode_options(e: &mut Encoder, o: &BulkWorkerOptions) -> Result<(
 pub(super) fn decode_options(d: &mut Decoder) -> Result<BulkWorkerOptions> {
     let path = d.sized_bytes(3900)?;
     let workspace = PathBuf::from(std::str::from_utf8(&path).map_err(|_| corrupt())?);
+    let parallelism = usize::try_from(d.u64()?).map_err(|_| corrupt())?;
+    let distributed_workers = usize::try_from(d.u64()?).map_err(|_| corrupt())?;
+    let lease_secs = d.u64()?;
+    let lease_nanos = d.u32()?;
+    if lease_nanos >= 1_000_000_000 {
+        return Err(corrupt());
+    }
     let options = BulkWorkerOptions {
         workspace,
-        parallelism: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
-        distributed_workers: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
-        unit_lease: Duration::from_millis(d.u64()?),
+        parallelism,
+        distributed_workers,
+        unit_lease: Duration::new(lease_secs, lease_nanos),
         memory_bytes: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
         graph_memory_bytes: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
         scratch_bytes: d.u64()?,

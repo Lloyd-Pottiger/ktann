@@ -37,9 +37,9 @@ use super::{
 #[path = "bulk_pipeline.rs"]
 pub(crate) mod bulk_pipeline;
 
-pub(super) const MAX_WRITER_LANES: usize = 16;
+pub(super) const MAX_WRITER_LANES: usize = 8;
 const MAX_TXN_AFFECTED_BYTES: usize = 8 * 1024 * 1024;
-const BUILD_UNIT_MUTATION_BYTES: usize = 296;
+pub(super) const BUILD_UNIT_MUTATION_BYTES: usize = 296;
 
 #[derive(Clone, Copy)]
 pub(crate) struct WriteFence {
@@ -521,6 +521,45 @@ pub(crate) async fn run<B: Backend>(
     .await
 }
 
+async fn peer_completed_loading<B: Backend>(
+    context: &OperationContext<B>,
+    expected: &IndexManifest,
+    retry: RetryPolicy,
+) -> Result<Option<BuildProgress>> {
+    let id = expected.logical_index_id();
+    let backend = context.backend();
+    retry_read(&context.options, Operation::RunBulkBuild, retry, || {
+        let backend = Arc::clone(&backend);
+        async move {
+            let mut rtxn = ReadLogicalTxn::bootstrap(backend.begin_read().await?);
+            let Some(PersistentValue::IndexManifest(m)) =
+                rtxn.get(LogicalKey::Manifest(id)).await?
+            else {
+                return Ok(None);
+            };
+            if !m.has_same_immutable_identity(expected) {
+                return Err(corrupt());
+            }
+            match m.lifecycle() {
+                IndexLifecycle::Active => match rtxn.get(LogicalKey::BuildProgress(id)).await? {
+                    Some(PersistentValue::BuildProgress(p)) => Ok(Some(p)),
+                    _ => Ok(None),
+                },
+                IndexLifecycle::Building => match rtxn.get(LogicalKey::BuildProgress(id)).await? {
+                    Some(PersistentValue::BuildProgress(p))
+                        if matches!(p.phase, BuildPhase::Loaded | BuildPhase::Validating) =>
+                    {
+                        Ok(Some(p))
+                    }
+                    _ => Ok(None),
+                },
+                IndexLifecycle::Dropping => Err(Error::new(ErrorKind::IndexDropping)),
+            }
+        }
+    })
+    .await
+}
+
 async fn run_normalized<B: Backend>(
     context: &mut OperationContext<B>,
     index: IndexManifest,
@@ -528,7 +567,8 @@ async fn run_normalized<B: Backend>(
     options: BulkWorkerOptions,
     retry: RetryPolicy,
 ) -> Result<BulkBuildReport> {
-    if options.distributed_workers > 1
+    let collab = options.distributed_workers > 1;
+    if collab
         && super::bulk_publish::already_active_retry(context, &index, retry)
             .await?
             .is_some()
@@ -544,8 +584,8 @@ async fn run_normalized<B: Backend>(
 
     let root = options.workspace.clone();
     let lock = Arc::new(blocking(context, move || lock_root(&root, false)).await?);
-    let (state, fence) = match claim(context, &index, &descriptor, options, retry).await? {
-        ClaimOutcome::AlreadyLoaded(p) => {
+    let (state, fence) = match claim(context, &index, &descriptor, options, retry).await {
+        Ok(ClaimOutcome::AlreadyLoaded(p)) => {
             return Ok(BulkBuildReport {
                 records: p.total_records,
                 trees: p.trees,
@@ -555,7 +595,21 @@ async fn run_normalized<B: Backend>(
                 ..BulkBuildReport::default()
             });
         }
-        ClaimOutcome::Claimed(state, fence) => (state, fence),
+        Ok(ClaimOutcome::Claimed(state, fence)) => (state, fence),
+        Err(e) if collab && e.kind() == ErrorKind::BulkBuildSuperseded => {
+            if let Some(p) = peer_completed_loading(context, &index, retry).await? {
+                return Ok(BulkBuildReport {
+                    records: p.total_records,
+                    trees: p.trees,
+                    partitions: p.partitions,
+                    entries: p.total_entries,
+                    rotation_seed: *index.rotation_seed(),
+                    ..BulkBuildReport::default()
+                });
+            }
+            return Err(e);
+        }
+        Err(e) => return Err(e),
     };
 
     let in_memory = state.options.distributed_workers == 1
@@ -585,6 +639,19 @@ async fn run_normalized<B: Backend>(
     )
     .await;
     if let Err(error) = &result {
+        if collab
+            && error.kind() == ErrorKind::BulkBuildSuperseded
+            && let Some(p) = peer_completed_loading(context, &index, retry).await?
+        {
+            return Ok(BulkBuildReport {
+                records: p.total_records,
+                trees: p.trees,
+                partitions: p.partitions,
+                entries: p.total_entries,
+                rotation_seed: *index.rotation_seed(),
+                ..BulkBuildReport::default()
+            });
+        }
         record_failure(context, &index, &state, Some(fence), error.kind(), retry).await?;
     }
     result
@@ -601,7 +668,7 @@ fn fits_in_memory(
     }
     let effective_mem = options.memory_bytes as u64;
     let dim = index.config().dimension() as u64;
-    let per_row = dim.saturating_mul(4).saturating_add(224);
+    let per_row = dim.saturating_mul(4).saturating_add(320);
     let wave_size = (options.parallelism.clamp(1, 16)) as u64;
     let est_segments = items.div_ceil(16_384).max(1);
     let avg_seg_bytes = descriptor.input().bytes() / est_segments;
@@ -883,10 +950,28 @@ pub(crate) async fn advance_loading_progress<B: Backend>(
             Some(l) => Some(l.read().await),
             None => None,
         };
-        if let Ok((Some(txn), ())) = step_once().await {
-            let _ = txn.commit().await;
+        match step_once().await {
+            Ok((Some(txn), ())) => {
+                if let Err(e) = txn.commit().await
+                    && e.kind() == ErrorKind::Corruption
+                {
+                    return Err(e);
+                }
+                Ok(())
+            }
+            Ok((None, ())) => Ok(()),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::RetryableAbort
+                        | ErrorKind::LimitExceeded
+                        | ErrorKind::CommitOutcomeUnknown
+                ) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e),
         }
-        Ok(())
     }
 }
 
@@ -1209,7 +1294,9 @@ fn split_delete_keys(
         if cost > max_bytes {
             return Err(Error::new(ErrorKind::LimitExceeded));
         }
-        if !cur.is_empty() && (cur.len() >= max_muts || cur_bytes + cost > max_bytes) {
+        if !cur.is_empty()
+            && (cur.len() >= max_muts || cur_bytes.checked_add(cost).is_none_or(|n| n > max_bytes))
+        {
             batches.push(std::mem::take(&mut cur));
             cur_bytes = 0;
         }
@@ -1278,8 +1365,12 @@ pub(super) fn split_into_chunks(
         }
         if !cur.is_empty()
             && (cur.len() >= max_muts
-                || cur_bytes + item_bytes > max_bytes
-                || cur_affected + item_affected > MAX_TXN_AFFECTED_BYTES)
+                || cur_bytes
+                    .checked_add(item_bytes)
+                    .is_none_or(|n| n > max_bytes)
+                || cur_affected
+                    .checked_add(item_affected)
+                    .is_none_or(|n| n > MAX_TXN_AFFECTED_BYTES))
         {
             chunks.push(std::mem::take(&mut cur));
             cur_bytes = 0;
@@ -1539,6 +1630,91 @@ pub(crate) async fn cleanup<B: Backend>(
         })
         .await?;
 
+    if let Some(state) = state_opt {
+        let lock = {
+            let mut lock_attempts = 0;
+            loop {
+                let root_c = state.options.workspace.clone();
+                match blocking(context, move || lock_root(&root_c, true)).await {
+                    Ok(file) => break Arc::new(file),
+                    Err(e)
+                        if e.kind() == ErrorKind::BulkBuildBusy
+                            && context.bulk_authority.is_some()
+                            && !retry.would_exhaust(lock_attempts) =>
+                    {
+                        retry.wait(lock_attempts).await;
+                        lock_attempts += 1;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        };
+
+        let auth = context.bulk_authority;
+        let adm = context.cpu_keep_alive();
+        let adm_ref = &adm;
+        let budget = backend.admission_budget();
+        let state_ref = &state;
+        let lock_ref = &lock;
+        retry_ctx_write(
+            context,
+            backend.as_ref(),
+            budget,
+            Operation::CleanupBulkBuild,
+            retry,
+            |mut txn| async move {
+                if let Some(value) = txn.get_for_update(LogicalKey::Manifest(id)).await? {
+                    match value {
+                        PersistentValue::IndexManifest(m)
+                            if m.logical_index_id() == id
+                                && m.lifecycle() != IndexLifecycle::Building => {}
+                        _ => return Err(Error::invalid_argument()),
+                    }
+                }
+                ensure_no_peer_scheduler_leases(
+                    auth,
+                    &mut txn,
+                    id,
+                    state_ref.options.distributed_workers,
+                )
+                .await?;
+                let key = LogicalKey::BuildWorkspace(id);
+                match txn.get_for_update(key.clone()).await? {
+                    None => {
+                        txn.rollback().await;
+                        return Ok((None, ()));
+                    }
+                    Some(PersistentValue::BuildWorkspace(w)) if &w == state_ref => {}
+                    _ => return Err(corrupt()),
+                }
+                let path = state_ref.directory();
+                let guard = Arc::clone(lock_ref);
+                let keep_alive = adm_ref.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _adm = keep_alive;
+                    let _lock = guard;
+                    match fs::remove_dir_all(&path) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(io(e)),
+                    };
+                    File::open(path.parent().expect("root"))
+                        .and_then(|f| f.sync_all())
+                        .map_err(io)
+                })
+                .await
+                .map_err(|e| Error::with_source(ErrorKind::Other, e))??;
+                txn.delete(key).await?;
+                Ok((Some(txn), ()))
+            },
+        )
+        .await?;
+
+        drop(lock);
+    }
+
+    retire_orphaned_schedule(context, id, retry).await?;
+
     if let Some(active) = &active_manifest {
         let budget = context.backend().admission_budget();
         clear_index_range(
@@ -1552,92 +1728,7 @@ pub(crate) async fn cleanup<B: Backend>(
         )
         .await?;
     }
-    let Some(state) = state_opt else {
-        retire_orphaned_schedule(context, id, retry).await?;
-        return Ok(());
-    };
-
-    let lock = {
-        let mut lock_attempts = 0;
-        loop {
-            let root_c = state.options.workspace.clone();
-            match blocking(context, move || lock_root(&root_c, true)).await {
-                Ok(file) => break Arc::new(file),
-                Err(e)
-                    if e.kind() == ErrorKind::BulkBuildBusy
-                        && context.bulk_authority.is_some()
-                        && !retry.would_exhaust(lock_attempts) =>
-                {
-                    retry.wait(lock_attempts).await;
-                    lock_attempts += 1;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    };
-
-    let auth = context.bulk_authority;
-    let adm = context.cpu_keep_alive();
-    let adm_ref = &adm;
-    let budget = backend.admission_budget();
-    let state_ref = &state;
-    let lock_ref = &lock;
-    retry_ctx_write(
-        context,
-        backend.as_ref(),
-        budget,
-        Operation::CleanupBulkBuild,
-        retry,
-        |mut txn| async move {
-            if let Some(value) = txn.get_for_update(LogicalKey::Manifest(id)).await? {
-                match value {
-                    PersistentValue::IndexManifest(m)
-                        if m.logical_index_id() == id
-                            && m.lifecycle() != IndexLifecycle::Building => {}
-                    _ => return Err(Error::invalid_argument()),
-                }
-            }
-            ensure_no_peer_scheduler_leases(
-                auth,
-                &mut txn,
-                id,
-                state_ref.options.distributed_workers,
-            )
-            .await?;
-            let key = LogicalKey::BuildWorkspace(id);
-            match txn.get_for_update(key.clone()).await? {
-                None => {
-                    txn.rollback().await;
-                    return Ok((None, ()));
-                }
-                Some(PersistentValue::BuildWorkspace(w)) if &w == state_ref => {}
-                _ => return Err(corrupt()),
-            }
-            let path = state_ref.directory();
-            let guard = Arc::clone(lock_ref);
-            let keep_alive = adm_ref.clone();
-            tokio::task::spawn_blocking(move || {
-                let _adm = keep_alive;
-                let _lock = guard;
-                match fs::remove_dir_all(&path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(io(e)),
-                };
-                File::open(path.parent().expect("root"))
-                    .and_then(|f| f.sync_all())
-                    .map_err(io)
-            })
-            .await
-            .map_err(|e| Error::with_source(ErrorKind::Other, e))??;
-            txn.delete(key).await?;
-            Ok((Some(txn), ()))
-        },
-    )
-    .await?;
-
-    drop(lock);
-    retire_orphaned_schedule(context, id, retry).await
+    Ok(())
 }
 
 pub(crate) fn io(e: std::io::Error) -> Error {
@@ -1648,8 +1739,70 @@ pub(crate) fn corrupt() -> Error {
     Error::new(ErrorKind::Corruption)
 }
 
-/// Visits a bounded page of namespace cleanup records across both `BuildWorkspace` and
-/// orphaned `BuildSchedule` entries.
+async fn scan_distinct_slot_ids<T: crate::storage::backend::ReadOps>(
+    rtxn: &mut ReadLogicalTxn<'_, T>,
+    after: Option<LogicalIndexId>,
+    maximum: usize,
+) -> Result<(Vec<LogicalIndexId>, bool)> {
+    let mut slot_ids = Vec::with_capacity(maximum);
+    let mut cursor = after;
+    let mut has_more = false;
+    while slot_ids.len() < maximum {
+        let range = LogicalRange::build_schedule_slots_after(cursor);
+        let page = rtxn
+            .scan(
+                &range,
+                None,
+                ScanLimits {
+                    item_limit: 64,
+                    byte_limit: 64 * 1024,
+                },
+            )
+            .await?;
+        if page.items().is_empty() {
+            break;
+        }
+        for item in page.items() {
+            let LogicalKey::BuildScheduleSlot { index: id, .. } = *item.key() else {
+                return Err(corrupt());
+            };
+            if slot_ids.last() != Some(&id) {
+                slot_ids.push(id);
+                cursor = Some(id);
+                if slot_ids.len() == maximum {
+                    has_more = page.next_cursor().is_some();
+                    break;
+                }
+            }
+        }
+        if slot_ids.len() == maximum {
+            if !has_more {
+                let probe = LogicalRange::build_schedule_slots_after(cursor);
+                has_more = !rtxn
+                    .scan(
+                        &probe,
+                        None,
+                        ScanLimits {
+                            item_limit: 1,
+                            byte_limit: 1024,
+                        },
+                    )
+                    .await?
+                    .items()
+                    .is_empty();
+            }
+            break;
+        }
+        if page.next_cursor().is_none() {
+            break;
+        }
+    }
+    Ok((slot_ids, has_more))
+}
+
+/// Visits a bounded page of namespace cleanup records across `BuildWorkspace`,
+/// `BuildSchedule`, and orphaned `BuildScheduleSlot` entries without skipping
+/// records when individual scan legs paginate at different Logical Index IDs.
 pub(crate) async fn cleanup_pending<B: Backend>(
     context: &mut OperationContext<B>,
     maximum: usize,
@@ -1684,29 +1837,46 @@ pub(crate) async fn cleanup_pending<B: Backend>(
                 },
             )
             .await?;
+        let (slot_ids, slot_more) = scan_distinct_slot_ids(&mut rtxn, after, maximum).await?;
 
-        let mut merged = BTreeSet::new();
+        let mut ws_ids = Vec::with_capacity(ws_page.items().len());
         for item in ws_page.items() {
             match *item.key() {
-                LogicalKey::BuildWorkspace(id) => {
-                    merged.insert(id);
-                }
+                LogicalKey::BuildWorkspace(id) => ws_ids.push(id),
                 _ => return Err(corrupt()),
             }
         }
+        let mut sched_ids = Vec::with_capacity(sched_page.items().len());
         for item in sched_page.items() {
             match *item.key() {
-                LogicalKey::BuildSchedule(id) => {
-                    merged.insert(id);
-                }
+                LogicalKey::BuildSchedule(id) => sched_ids.push(id),
                 _ => return Err(corrupt()),
             }
         }
-        let total_candidates = merged.len();
-        let ids: Vec<LogicalIndexId> = merged.into_iter().take(maximum).collect();
-        let has_more = total_candidates > maximum
-            || ws_page.next_cursor().is_some()
-            || sched_page.next_cursor().is_some();
+
+        let ws_more = ws_page.next_cursor().is_some();
+        let sched_more = sched_page.next_cursor().is_some();
+        let upper_bound = [
+            (ws_ids.last().copied(), ws_more),
+            (sched_ids.last().copied(), sched_more),
+            (slot_ids.last().copied(), slot_more),
+        ]
+        .into_iter()
+        .filter_map(|(last, more)| more.then_some(last).flatten())
+        .min();
+
+        let mut merged = BTreeSet::new();
+        merged.extend(ws_ids);
+        merged.extend(sched_ids);
+        merged.extend(slot_ids);
+
+        let total_merged = merged.len();
+        let ids: Vec<LogicalIndexId> = merged
+            .into_iter()
+            .filter(|&id| upper_bound.is_none_or(|ub| id <= ub))
+            .take(maximum)
+            .collect();
+        let has_more = ids.len() < total_merged || ws_more || sched_more || slot_more;
         (ids, has_more)
     };
 

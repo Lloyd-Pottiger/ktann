@@ -745,3 +745,111 @@ async fn unkeyed_build_reports_real_stage_metrics_and_reuses_published_index() {
     }
     runtime.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn collaborative_halo_early_convergence_and_corrupt_leafkeys_fail_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let memory = MemoryBackend::new();
+    let rt1 = runtime(memory.clone());
+    let rt2 = runtime(memory.clone());
+
+    let input = InputSnapshot::create(
+        &dir.path().join("source"),
+        config(Metric::Cosine, false),
+        16 << 20,
+        (0..120).map(|id| Ok(record(id))),
+    )
+    .unwrap();
+    let job1 = rt1
+        .start_bulk_build(
+            "halo-conv",
+            &input,
+            BulkBuildOptions {
+                sample_items: 16,
+                refinement_rounds: Some(4),
+            },
+        )
+        .await
+        .unwrap();
+    let job2 = rt2.open_bulk_build("halo-conv").await.unwrap();
+
+    let mut opts = worker_options(&dir);
+    opts.distributed_workers = 2;
+    opts.parallelism = 2;
+    opts.memory_bytes = 128 * 1024; // Force multi-shard heavy tree + disk halo refinement
+
+    let (r1, r2) = tokio::join!(job1.complete(opts.clone()), job2.complete(opts.clone()));
+    let idx = r1.unwrap();
+    assert_eq!(idx.logical_index_id(), r2.unwrap().logical_index_id());
+    let verified = idx.verify(VerifyOptions::default()).await.unwrap();
+    assert!(verified.complete && verified.issues.is_empty());
+    assert_eq!(verified.objects.vector_records, 120);
+
+    // Corrupt `plan-e1.bin` (`total_shards = 0` on non-empty input with valid checksum) fails closed.
+    let dir_bad = tempfile::tempdir().unwrap();
+    let job_bad = rt1
+        .start_bulk_build("bad-plan", &input, construction_options())
+        .await
+        .unwrap();
+    let mut bad_opts = worker_options(&dir_bad);
+    bad_opts.memory_bytes = 16 * 1024;
+    job_bad.run_worker(bad_opts.clone()).await.unwrap();
+
+    // Start a fresh build and pre-seed a valid-checksummed corrupt `plan-e1.bin` (`total_shards = 0`)
+    // in its owned workspace directory after interrupting before `Loaded`.
+    let job_bad2 = rt1
+        .start_bulk_build("bad-plan-2", &input, construction_options())
+        .await
+        .unwrap();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    cancel.cancel();
+    let _ = job_bad2
+        .run_worker_with_control(
+            bad_opts.clone(),
+            ktann::api::OperationOptions::default().with_cancellation(cancel),
+        )
+        .await;
+    // Claim epoch 1 workspace, then tamper `plan-e1.bin` with valid xxh3_64 trailer.
+    let mut rtxn = ReadLogicalTxn::bootstrap(memory.begin_read().await.unwrap());
+    if rtxn
+        .get(LogicalKey::BuildWorkspace(job_bad2.logical_index_id()))
+        .await
+        .unwrap()
+        .is_none()
+    {
+        // Trigger claim + disk spill, then bump epoch via re-run with tampered `plan-e2.bin`.
+        job_bad2.run_worker(bad_opts.clone()).await.unwrap();
+    }
+    drop(rtxn);
+    for entry in fs::read_dir(&bad_opts.workspace).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            let mut corrupt_body = Vec::new();
+            corrupt_body.extend_from_slice(b"KTANNPL2");
+            corrupt_body.extend_from_slice(&16_384_u64.to_be_bytes()); // target_shard_rows
+            corrupt_body.extend_from_slice(&0_u32.to_be_bytes()); // light_shard_start
+            corrupt_body.extend_from_slice(&0_u32.to_be_bytes()); // light_shard_count
+            corrupt_body.extend_from_slice(&0_u32.to_be_bytes()); // total_shards = 0 for 120 items!
+            corrupt_body.extend_from_slice(&0_u32.to_be_bytes()); // id_bounds_len
+            corrupt_body.extend_from_slice(&0_u32.to_be_bytes()); // heavy_len
+            let csum = xxhash_rust::xxh3::xxh3_64(&corrupt_body);
+            corrupt_body.extend_from_slice(&csum.to_be_bytes());
+            fs::write(entry.path().join("plan-e2.bin"), corrupt_body).unwrap();
+        }
+    }
+    // Reset `BuildProgress` to `Preparing` so epoch 2 runs `ShardPlan::load` on `plan-e2.bin`.
+    let mut wtxn = memory.begin_write().await.unwrap();
+    wtxn.delete(Bytes::from(keys::build_progress_key(
+        job_bad2.logical_index_id(),
+    )))
+    .await
+    .unwrap();
+    wtxn.commit().await.unwrap();
+    assert_eq!(
+        job_bad2.run_worker(bad_opts).await.unwrap_err().kind(),
+        ErrorKind::Corruption
+    );
+
+    rt1.shutdown().await.unwrap();
+    rt2.shutdown().await.unwrap();
+}

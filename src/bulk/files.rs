@@ -1,10 +1,10 @@
 //! Segmented immutable input files and atomic workspace file helpers.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
@@ -19,6 +19,7 @@ const SEGMENTS_HEADER_BYTES: u64 = 46;
 const SEGMENT_ENTRY_BYTES: u64 = 48;
 const FRAME_OVERHEAD: u64 = 36;
 const IO_BUFFER_BYTES: usize = 256 * 1024;
+const MAX_OPEN_SEGMENTS: usize = 32;
 
 const KIND_INPUT: u8 = 0;
 const KIND_SEGMENTS_INDEX: u8 = 1;
@@ -438,17 +439,17 @@ pub(crate) struct SegmentReader {
     consumed: u64,
     maximum_frame: usize,
     done: bool,
-    verified_tracker: Option<(Arc<[AtomicBool]>, usize)>,
+    verified_tracker: Option<(Arc<[Mutex<bool>]>, usize)>,
 }
 
 impl SegmentReader {
-    pub(super) fn open(
+    pub(crate) fn open(
         directory: &Path,
         index: usize,
         binding: [u8; 32],
         meta: SegmentMeta,
         maximum_frame: usize,
-        verified_tracker: Option<(Arc<[AtomicBool]>, usize)>,
+        verified_tracker: Option<(Arc<[Mutex<bool>]>, usize)>,
     ) -> Result<Self> {
         Self::open_with_capacity(
             directory,
@@ -461,7 +462,7 @@ impl SegmentReader {
         )
     }
 
-    pub(super) fn open_strided(
+    pub(crate) fn open_strided(
         directory: &Path,
         index: usize,
         binding: [u8; 32],
@@ -478,7 +479,7 @@ impl SegmentReader {
         meta: SegmentMeta,
         maximum_frame: usize,
         buffer_capacity: usize,
-        verified_tracker: Option<(Arc<[AtomicBool]>, usize)>,
+        verified_tracker: Option<(Arc<[Mutex<bool>]>, usize)>,
     ) -> Result<Self> {
         let file = File::open(directory.join(segment_file_name(index))).map_err(io_error)?;
         if file.metadata().map_err(io_error)?.len() != meta.bytes {
@@ -521,7 +522,7 @@ impl SegmentReader {
             if let Some((flags, idx)) = &self.verified_tracker
                 && let Some(flag) = flags.get(*idx)
             {
-                flag.store(true, AtomicOrdering::Release);
+                *flag.lock().unwrap_or_else(|e| e.into_inner()) = true;
             }
             return Ok(None);
         }
@@ -615,21 +616,19 @@ impl SegmentReader {
     }
 }
 
-/// Bounded single-file handle cache with coalesced forward read-ahead and segment authentication.
+/// Bounded segment-handle cache with exact-frame `pread` and single-flight whole-segment authentication.
 ///
-/// Keeps at most one open OS file descriptor regardless of segment count (`O(1)` FDs even at
-/// 610,000+ segments), verifies the 42-byte segment header and whole-segment SHA-256 on first
-/// access if not yet verified in this process, and coalesces forward reads through a `256 KiB`
-/// window to avoid per-record `pread` syscalls.
+/// Retains at most `MAX_OPEN_SEGMENTS` (`32`) open OS file descriptors regardless of segment
+/// count (`O(1)` FDs even at 610,000+ segments), coordinates first-access whole-segment SHA-256
+/// verification per segment across threads, and reads each requested record frame at its exact
+/// byte span into a reusable scratch buffer without speculative read-ahead amplification.
 pub(crate) struct SegmentFileReader<'a> {
     directory: &'a Path,
     binding: [u8; 32],
     segments: &'a [SegmentMeta],
-    verified: &'a [AtomicBool],
-    current: Option<(u32, File, u64)>,
-    window: Vec<u8>,
-    window_offset: u64,
-    window_len: usize,
+    verified: &'a [Mutex<bool>],
+    open_files: BTreeMap<u32, (File, u64)>,
+    scratch: Vec<u8>,
 }
 
 impl<'a> SegmentFileReader<'a> {
@@ -638,53 +637,47 @@ impl<'a> SegmentFileReader<'a> {
         directory: &'a Path,
         binding: [u8; 32],
         segments: &'a [SegmentMeta],
-        verified: &'a [AtomicBool],
+        verified: &'a [Mutex<bool>],
     ) -> Self {
         Self {
             directory,
             binding,
             segments,
             verified,
-            current: None,
-            window: vec![0_u8; IO_BUFFER_BYTES],
-            window_offset: 0,
-            window_len: 0,
+            open_files: BTreeMap::new(),
+            scratch: Vec::with_capacity(4096),
         }
     }
 
     pub(crate) fn read_frame(&mut self, seg_idx: u32, offset: u64, body_len: u32) -> Result<Bytes> {
-        let need_open = self
-            .current
-            .as_ref()
-            .is_none_or(|(idx, _, _)| *idx != seg_idx);
-        if need_open {
+        if !self.open_files.contains_key(&seg_idx) {
             let meta = self.segments.get(seg_idx as usize).ok_or_else(corrupt)?;
             let mut file = File::open(self.directory.join(segment_file_name(seg_idx as usize)))
                 .map_err(io_error)?;
             if file.metadata().map_err(io_error)?.len() != meta.bytes || meta.bytes < HEADER_BYTES {
                 return Err(corrupt());
             }
-            let already_verified = self
-                .verified
-                .get(seg_idx as usize)
-                .is_some_and(|f| f.load(AtomicOrdering::Acquire));
-            if already_verified {
-                let mut header = [0_u8; HEADER_BYTES as usize];
-                file.read_exact(&mut header).map_err(io_error)?;
-                if parse_header(&header, KIND_INPUT)? != self.binding {
-                    return Err(corrupt());
+            if let Some(lock) = self.verified.get(seg_idx as usize) {
+                let mut done = lock.lock().unwrap_or_else(|e| e.into_inner());
+                if *done {
+                    let mut header = [0_u8; HEADER_BYTES as usize];
+                    file.read_exact(&mut header).map_err(io_error)?;
+                    if parse_header(&header, KIND_INPUT)? != self.binding {
+                        return Err(corrupt());
+                    }
+                } else {
+                    verify_whole_segment(&mut file, self.binding, *meta)?;
+                    *done = true;
                 }
             } else {
                 verify_whole_segment(&mut file, self.binding, *meta)?;
-                if let Some(flag) = self.verified.get(seg_idx as usize) {
-                    flag.store(true, AtomicOrdering::Release);
-                }
             }
-            self.current = Some((seg_idx, file, meta.bytes));
-            self.window_offset = 0;
-            self.window_len = 0;
+            if self.open_files.len() >= MAX_OPEN_SEGMENTS {
+                self.open_files.pop_first();
+            }
+            self.open_files.insert(seg_idx, (file, meta.bytes));
         }
-        let &(_, ref file, seg_bytes) = self.current.as_ref().expect("opened segment");
+        let &(ref file, seg_bytes) = self.open_files.get(&seg_idx).expect("opened segment");
         let body_usize = body_len as usize;
         if offset < HEADER_BYTES || body_usize == 0 || body_usize > MAX_VALUE_BYTES {
             return Err(corrupt());
@@ -697,23 +690,10 @@ impl<'a> SegmentFileReader<'a> {
         if end_offset > seg_bytes {
             return Err(corrupt());
         }
-        if total <= self.window.len() {
-            let win_end = self.window_offset + self.window_len as u64;
-            if offset < self.window_offset || end_offset > win_end {
-                let read_len = ((seg_bytes - offset) as usize).min(self.window.len());
-                read_at_exact(file, &mut self.window[..read_len], offset)?;
-                self.window_offset = offset;
-                self.window_len = read_len;
-            }
-            let start = (offset - self.window_offset) as usize;
-            let raw = &self.window[start..start + total];
-            validate_frame_bytes(raw, body_len)?;
-            return Ok(Bytes::copy_from_slice(&raw[4..4 + body_usize]));
-        }
-        let mut buf = vec![0_u8; total];
-        read_at_exact(file, &mut buf, offset)?;
-        validate_frame_bytes(&buf, body_len)?;
-        Ok(Bytes::from(buf).slice(4..4 + body_usize))
+        self.scratch.resize(total, 0);
+        read_at_exact(file, &mut self.scratch[..total], offset)?;
+        validate_frame_bytes(&self.scratch[..total], body_len)?;
+        Ok(Bytes::copy_from_slice(&self.scratch[4..4 + body_usize]))
     }
 }
 
@@ -772,12 +752,7 @@ fn validate_frame_bytes(buf: &[u8], body_len: u32) -> Result<()> {
     Ok(())
 }
 
-/// Writes a workspace file atomically via a sibling temporary file, syncing both the
-/// file and its parent directory before returning the written byte length.
-pub(crate) fn write_atomic(
-    path: &Path,
-    write_fn: impl FnOnce(&mut BufWriter<File>) -> Result<()>,
-) -> Result<u64> {
+pub(crate) fn make_temp_path(path: &Path) -> Result<PathBuf> {
     let mut nonce = [0_u8; 16];
     getrandom::fill(&mut nonce).map_err(|e| Error::with_source(ErrorKind::Other, e))?;
     let nonce_hex: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
@@ -785,12 +760,18 @@ pub(crate) fn write_atomic(
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(Error::invalid_argument)?;
-    let temp_path = path.with_file_name(format!(".{file_name}.tmp-{nonce_hex}"));
+    Ok(path.with_file_name(format!(".{file_name}.tmp-{nonce_hex}")))
+}
+
+pub(crate) fn write_temp_file(
+    temp_path: &Path,
+    write_fn: impl FnOnce(&mut BufWriter<File>) -> Result<()>,
+) -> Result<u64> {
     let result = (|| -> Result<u64> {
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&temp_path)
+            .open(temp_path)
             .map_err(io_error)?;
         let mut writer = BufWriter::with_capacity(IO_BUFFER_BYTES, file);
         write_fn(&mut writer)?;
@@ -798,17 +779,18 @@ pub(crate) fn write_atomic(
         let file = writer.into_inner().map_err(|e| io_error(e.into_error()))?;
         let bytes = file.metadata().map_err(io_error)?.len();
         file.sync_all().map_err(io_error)?;
-        drop(file);
-        fs::rename(&temp_path, path).map_err(io_error)?;
-        sync_dir(
-            path.parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(Path::new(".")),
-        )?;
         Ok(bytes)
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&temp_path);
+        let _ = fs::remove_file(temp_path);
     }
     result
+}
+
+pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
+    sync_dir(
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+    )
 }

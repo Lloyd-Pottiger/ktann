@@ -51,7 +51,7 @@ impl TreeKeySchema {
     }
 }
 
-/// A typed half-open range over one Logical Index or bootstrap metadata table.
+/// A typed half-open range over one Logical Index or bootstrap metadata namespace.
 ///
 /// Raw range bounds remain private so algorithm modules cannot compose logical
 /// keys or resume a scan outside the range that produced its cursor. Index-bound
@@ -97,11 +97,17 @@ impl LogicalRange {
     /// Selects all `BuildUnit`s in one stage of `index` for bootstrap or index-bound scans.
     #[must_use]
     pub(crate) fn build_units(index: LogicalIndexId, stage: u8) -> Self {
+        Self::build_units_from(index, stage, 0)
+    }
+
+    /// Selects `BuildUnit`s in one stage of `index` starting at `from_unit`.
+    #[must_use]
+    pub(crate) fn build_units_from(index: LogicalIndexId, stage: u8, from_unit: u32) -> Self {
         Self {
             index: None,
             bootstrap_index: Some(index),
             schema: TreeKeySchema::empty(),
-            raw: keys::build_unit_stage_range(index, stage),
+            raw: keys::build_unit_stage_range_from(index, stage, from_unit),
         }
     }
 
@@ -113,6 +119,17 @@ impl LogicalRange {
             bootstrap_index: Some(index),
             schema: TreeKeySchema::empty(),
             raw: keys::build_schedule_slot_range(index),
+        }
+    }
+
+    /// Selects namespace `BuildScheduleSlot` entries strictly after all slots of `after`.
+    #[must_use]
+    pub(crate) fn build_schedule_slots_after(after: Option<LogicalIndexId>) -> Self {
+        Self {
+            index: None,
+            bootstrap_index: None,
+            schema: TreeKeySchema::empty(),
+            raw: keys::build_schedule_slot_all_range(after),
         }
     }
 
@@ -138,14 +155,14 @@ impl LogicalRange {
         }
     }
 
-    /// Selects one disjoint serving-keyspace validation slice `[start, end)` inside `manifest`.
+    /// Selects one disjoint validation slice `[start, end)` inside `manifest`'s full index range.
     pub(crate) fn validation_slice(
         manifest: &IndexManifest,
         start: Vec<u8>,
         end: Vec<u8>,
     ) -> Result<Self> {
-        let serving = keys::serving_data_range(manifest.logical_index_id());
-        if start.as_slice() < serving.start() || end.as_slice() > serving.end() || start >= end {
+        let full = keys::index_range(manifest.logical_index_id());
+        if start.as_slice() < full.start() || end.as_slice() > full.end() || start >= end {
             return Err(Error::new(ErrorKind::Corruption));
         }
         Ok(Self::bind(manifest, KeyRange::new(start, end)))

@@ -1018,9 +1018,14 @@ fn bulk_workspace_golden_and_malformed_ownership() {
     let key = LogicalKey::BuildWorkspace(id(1));
     let mut golden = vec![0x0f, 0, 0, 0, 5];
     golden.extend_from_slice(b"/bulk");
-    // parallelism=1, distributed_workers=1, unit_lease_ms=10, memory=1, graph_mem=1, scratch=1,
-    // load.max_mutations=2, load.max_bytes=1, hard_limits=(1, 1)
-    for n in [1_u64, 1, 10, 1, 1, 1, 2, 1, 1, 1] {
+    // parallelism=1, distributed_workers=1, unit_lease=(0s, 10_000_000ns), memory=1, graph_mem=1,
+    // scratch=1, load.max_mutations=2, load.max_bytes=1, hard_limits=(1, 1)
+    for n in [1_u64, 1, 0] {
+        golden.extend_from_slice(&n.to_be_bytes());
+    }
+    let nanos_offset = golden.len();
+    golden.extend_from_slice(&10_000_000_u32.to_be_bytes());
+    for n in [1_u64, 1, 1, 2, 1, 1, 1] {
         golden.extend_from_slice(&n.to_be_bytes());
     }
     let token_offset = golden.len();
@@ -1037,6 +1042,9 @@ fn bulk_workspace_golden_and_malformed_ownership() {
                 .is_err()
         );
     }
+    let mut bad_nanos = golden.clone();
+    bad_nanos[nanos_offset..nanos_offset + 4].copy_from_slice(&1_000_000_000_u32.to_be_bytes());
+    assert!(codec.decode(&key, Bytes::from(bad_nanos)).is_err());
     for (offset, replacement) in [(5, b'x'), (golden.len() - 1, 255)] {
         let mut malformed = golden.clone();
         malformed[offset] = replacement;
@@ -1127,7 +1135,11 @@ fn build_schedule_golden_and_malformed_lease() {
     let key = LogicalKey::BuildSchedule(id(1));
     let mut golden = vec![0x11, 0, 0, 0, 1, b'x', 0, 0, 0, 5];
     golden.extend_from_slice(b"/bulk");
-    for n in [1_u64, 1, 10, 1, 1, 1, 2, 1] {
+    for n in [1_u64, 1, 0] {
+        golden.extend_from_slice(&n.to_be_bytes());
+    }
+    golden.extend_from_slice(&10_000_000_u32.to_be_bytes());
+    for n in [1_u64, 1, 1, 2, 1] {
         golden.extend_from_slice(&n.to_be_bytes());
     }
     let value = codec.decode(&key, Bytes::from(golden.clone())).unwrap();

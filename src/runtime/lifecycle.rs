@@ -758,10 +758,52 @@ pub(crate) async fn build_status<B: Backend>(
                 None => BulkBuildStatus::Preparing,
                 Some(PersistentValue::BuildProgress(p)) => match p.phase {
                     crate::storage::values::BuildPhase::Preparing => BulkBuildStatus::Preparing,
-                    crate::storage::values::BuildPhase::Loading => BulkBuildStatus::Loading {
-                        loaded_entries: p.loaded_entries,
-                        total_entries: p.total_entries,
-                    },
+                    crate::storage::values::BuildPhase::Loading => {
+                        let mut loaded_entries = p.loaded_entries;
+                        if loaded_entries == 0 {
+                            for stage in [
+                                crate::runtime::bulk_worker::bulk_pipeline::STAGE_EMIT_RECORDS,
+                                crate::runtime::bulk_worker::bulk_pipeline::STAGE_EMIT_TREES,
+                                crate::runtime::bulk_worker::bulk_pipeline::STAGE_EMIT_LEAVES,
+                            ] {
+                                let range = crate::storage::LogicalRange::build_units(id, stage);
+                                let mut cursor = None;
+                                loop {
+                                    let page = txn
+                                        .scan(
+                                            &range,
+                                            cursor.as_ref(),
+                                            crate::storage::backend::ScanLimits {
+                                                item_limit: 260,
+                                                byte_limit: 256 * 1024,
+                                            },
+                                        )
+                                        .await?;
+                                    for item in page.items() {
+                                        let PersistentValue::BuildUnit(u) = item.value() else {
+                                            return Err(Error::new(ErrorKind::Corruption));
+                                        };
+                                        if u.epoch != p.epoch {
+                                            return Err(Error::new(ErrorKind::Corruption));
+                                        }
+                                        if u.complete {
+                                            loaded_entries = loaded_entries
+                                                .checked_add(u.kv_count)
+                                                .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+                                        }
+                                    }
+                                    cursor = page.into_next_cursor();
+                                    if cursor.is_none() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        BulkBuildStatus::Loading {
+                            loaded_entries,
+                            total_entries: p.total_entries.max(loaded_entries),
+                        }
+                    }
                     crate::storage::values::BuildPhase::Loaded => BulkBuildStatus::Loaded {
                         entries: p.total_entries,
                     },

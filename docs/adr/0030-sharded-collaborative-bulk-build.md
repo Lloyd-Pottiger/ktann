@@ -28,10 +28,10 @@ on one large build (`10M–10B` vectors).
    `64 MiB`) indexed by `segments.bin` and sealed by the 90-byte `InputManifest`.
    `storage::FORMAT_VERSION` remains `1` (KTANN has no prior stable release).
 2. **Partition work with a deterministic `ShardPlan`.** A bounded uniform strided
-   full-segment sample (`<= 32,768` items) defines quantile Record-ID buckets
-   (`<= 4,096`) and Coarse Shards (`<= 65,536`, with a two-level super-centroid
-   index and 3-nearest candidate lists when a heavy tree has `>= 32` coarse
-   shards).
+   full-segment sample (scaling up to `131,072` items within working memory)
+   defines quantile Record-ID buckets (`<= 4,096`) and Coarse Shards (`<= 65,536`,
+   with a two-level super-centroid index and 3-nearest candidate lists when a
+   heavy tree has `>= 32` coarse shards).
 3. **Execute a single sharded pipeline over a typed `StageStore`
    (`Memory` vs `Disk`) and collaborative `BuildUnit`s.** One unified stage graph
    (`Plan -> Scatter -> Dedup -> Leaves -> [Halo Refine] -> Emit`) handles both
@@ -40,29 +40,31 @@ on one large build (`10M–10B` vectors).
    structures in `StageStore::Memory` (`0` workspace scratch bytes and no
    intermediate codec round-trips), while constrained-memory and multi-worker
    builds (`distributed_workers > 1`) persist checksummed per-unit files
-   (`shard-*`, `centers-*`, `loc-*`, `ids-*`, `idref-*`, `prop-*`) via
+   (`shard-*`, `centers-*`, `loc-*`, `ids-*`, `idref-*`, `prop-*`, `out-*`) via
    `StageStore::Disk` and coordinate `LogicalKey::BuildUnit` /
    `BuildScheduleSlot` leases in the KV backend. Both modes emit serving KVs in
    ascending keyspace order (`[0x01 RecordGroup] -> [0x03/0x04]`).
 4. **Bound refinement neighborhoods (`max_halo_leaves <= 32,768`) and defer
    `RaBitQ7` quantization to leaf emission.** No worker holds whole-tree leaf
-   metadata above `32,768` leaves (`~100 MiB`), and scatter/refinement buffers
-   avoid carrying `RaBitQ7` codes. Upper-tree internal partitions build local
-   HNSW graphs directly from in-memory `&[ChildEntry]` slices.
-5. **Load across 16 pipelined writer tasks fenced on `BuildWorkspace.writer_token`
-   and validate frozen slices in parallel with 512-bit SHA-512 `LtHash` + full
-   `ValueCodec` decoding.** Serving writes batch up to `4 MiB` / `5,000`
-   mutations (capped at `8 MiB` estimated FoundationDB affected bytes) across
-   16 concurrent writer tasks whose read-conflict-protected `BuildWorkspace`
-   check conflicts only when epoch ownership changes or validation freezes
-   writers. Three 512-bit homomorphic multiset equations verify global ID
-   uniqueness, `RecordLocation == LeafEntry` equality, and
-   `Centroid == ChildEntry` closure; `publish` freezes writers by clearing
-   `BuildWorkspace.writer_token`, scans `1..=256` keyspace slices
-   collaboratively via short-lived `ReadTxn`s, decodes every serving key/value
-   through `ValueCodec`, and checks exact count and `expected_kv_lthash` before
-   flipping `Building -> Active` and reclaiming transient `[0x07..0x08)` build
-   unit metadata.
+   metadata above `32,768` leaves (`~100 MiB`), cross-shard outbound moves are
+   sliced per recipient so donor shards are read once, and scatter/refinement
+   buffers avoid carrying `RaBitQ7` codes. Upper-tree internal partitions build
+   local HNSW graphs directly from in-memory `&[ChildEntry]` slices.
+5. **Load across up to 8 pipelined writer tasks per worker fenced on
+   `BuildWorkspace.writer_token` and validate frozen slices across the full
+   `index_range` in parallel with 512-bit SHA-512 `LtHash` + full `ValueCodec`
+   decoding.** Serving writes batch up to `4 MiB` / `5,000` mutations (capped at
+   `8 MiB` estimated FoundationDB affected bytes) across up to 8 concurrent
+   writer tasks per worker whose read-conflict-protected `BuildWorkspace` check
+   conflicts only when epoch ownership changes or validation freezes writers.
+   Three 512-bit homomorphic multiset equations verify global ID uniqueness,
+   `RecordLocation == LeafEntry` equality, and `Centroid == ChildEntry` closure;
+   `publish` freezes writers by clearing `BuildWorkspace.writer_token`, scans
+   `1..=256` disjoint slices spanning `index_range(id)` collaboratively via
+   short-lived `ReadTxn`s, decodes every index key/value through `ValueCodec`,
+   and checks exact serving count and `expected_kv_lthash` before flipping
+   `Building -> Active` and reclaiming transient `[0x07..0x08)` build unit
+   metadata.
 
 ## Consequences
 

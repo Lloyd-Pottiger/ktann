@@ -11,8 +11,8 @@ use crate::observe::labels::Operation;
 use crate::storage::backend::{Backend, ReadTxn, ScanLimits};
 use crate::storage::keys::{self, LogicalKey};
 use crate::storage::values::{
-    BuildDescriptor, BuildPhase, BuildProgress, BuildUnit, BuildWorkspace, IndexLifecycle,
-    IndexManifest, PersistentValue, ValueCodec,
+    BuildDescriptor, BuildPhase, BuildProgress, BuildWorkspace, IndexLifecycle, IndexManifest,
+    PersistentValue, ValueCodec,
 };
 use crate::storage::{LogicalRange, LogicalScanCursor, ReadLogicalTxn, WriteLogicalTxn};
 
@@ -89,9 +89,7 @@ async fn publish_inner<B: Backend>(
         activate(context, &index, &descriptor, &state, &progress, retry).await
     }
     .await;
-    if let Err(e) = &result
-        && e.kind() != ErrorKind::LimitExceeded
-    {
+    if let Err(e) = &result {
         bulk_worker::record_failure(context, &index, &state, None, e.kind(), retry).await?;
     }
     result
@@ -134,8 +132,7 @@ async fn read_active<T: ReadTxn>(
     }
 }
 
-/// Atomically clears `BuildWorkspace.writer_token` and flips `BuildProgress` to `Validating`,
-/// initializing `STAGE_VALIDATE` `BuildUnit`s inline when they fit in one transaction.
+/// Atomically clears `BuildWorkspace.writer_token` and flips `BuildProgress` to `Validating`.
 async fn begin_validation<B: Backend>(
     context: &mut OperationContext<B>,
     index: &IndexManifest,
@@ -212,20 +209,6 @@ async fn begin_validation<B: Backend>(
                 PersistentValue::BuildWorkspace(w),
             )
             .await?;
-            let slices = progress.validation_slices();
-            if budget.max_mutations >= (slices as usize + 2) {
-                for s in 0..slices {
-                    txn.put(
-                        LogicalKey::BuildUnit {
-                            index: id,
-                            stage: STAGE_VALIDATE,
-                            unit: s,
-                        },
-                        PersistentValue::BuildUnit(BuildUnit::unclaimed(progress.epoch)),
-                    )
-                    .await?;
-                }
-            }
             let next = BuildProgress {
                 phase: BuildPhase::Validating,
                 ..progress
@@ -248,20 +231,20 @@ fn slice_logical_range(
 ) -> Result<LogicalRange> {
     let id = manifest.logical_index_id();
     validate_split_keys_in_index(id, split_keys)?;
-    let serving = keys::serving_data_range(id);
+    let full = keys::index_range(id);
     let idx = slice as usize;
     if idx > split_keys.len() {
         return Err(corrupt());
     }
     let start = if idx == 0 {
-        serving.start().to_vec()
+        full.start().to_vec()
     } else {
         split_keys[idx - 1].to_vec()
     };
     let end = if idx < split_keys.len() {
         split_keys[idx].to_vec()
     } else {
-        serving.end().to_vec()
+        full.end().to_vec()
     };
     LogicalRange::validation_slice(manifest, start, end)
 }
@@ -297,9 +280,7 @@ async fn validate_all_slices<B: Backend>(
         retry,
     };
 
-    if context.backend().admission_budget().max_mutations < (slices as usize + 2) {
-        init_stage_units(&env, STAGE_VALIDATE, slices).await?;
-    }
+    init_stage_units(&env, STAGE_VALIDATE, slices).await?;
     drive_stage(&env, STAGE_VALIDATE, slices, concurrency, {
         let env = env.clone();
         move |slice, _lease| {
@@ -312,8 +293,9 @@ async fn validate_all_slices<B: Backend>(
     Ok(())
 }
 
-/// Scans `[slice_start, slice_end)` across rotated frozen snapshots via `scan_raw_validated`,
-/// decoding every serving key and value fail-closed and returning `(kv_count, kv_lthash)`.
+/// Scans `[slice_start, slice_end)` across short-lived frozen snapshots via `scan_raw_validated`,
+/// dropping each `ReadLogicalTxn` before CPU decoding/hashing so blocking adapter pools are never
+/// pinned across CPU work, and decoding every key/value in `index_range` fail-closed.
 async fn scan_validation_slice<B: Backend>(
     env: &StageEnv<B>,
     split_keys: &[Bytes],
@@ -323,25 +305,22 @@ async fn scan_validation_slice<B: Backend>(
     let epoch = env.fence.epoch();
     let page_items = env.budget.max_mutations.max(1);
     let page_bytes = env.budget.max_mutation_bytes.max(1);
+    let batch_byte_cap = page_bytes.clamp(256 * 1024, 4 * 1024 * 1024);
     let mut cursor: Option<LogicalScanCursor> = None;
     let mut slice_count = 0_u64;
     let mut slice_lt = LtHash::ZERO;
-    let mut rtxn: Option<(ReadLogicalTxn<'_, B::ReadTxn<'_>>, Instant)> = None;
 
     loop {
         super::check_control(&env.control)?;
         let mut page_attempts = 0;
         let (raw_items, next_cursor) = loop {
             super::check_control(&env.control)?;
-            let need_fresh = rtxn
-                .as_ref()
-                .is_none_or(|(_, opened)| opened.elapsed() >= READ_SNAPSHOT_ROTATE_INTERVAL);
-            if need_fresh {
-                rtxn = None;
+            let opened = Instant::now();
+            let mut active_rtxn =
                 match open_frozen_validation_snapshot(env.backend.as_ref(), &env.manifest, epoch)
                     .await
                 {
-                    Ok(fresh) => rtxn = Some((fresh, Instant::now())),
+                    Ok(fresh) => fresh,
                     Err(e) if e.kind() == ErrorKind::RetryableAbort => {
                         env.retry
                             .wait_or_exhaust(Operation::PublishBulkBuild, &mut page_attempts)
@@ -349,23 +328,45 @@ async fn scan_validation_slice<B: Backend>(
                         continue;
                     }
                     Err(e) => return Err(e),
+                };
+
+            let mut gathered = Vec::new();
+            let mut gathered_bytes = 0_usize;
+            let mut cur_cursor = cursor.clone();
+            let mut pages_read = 0_usize;
+            let scan_res: Result<Option<LogicalScanCursor>> = async {
+                loop {
+                    let (mut items, nc) = active_rtxn
+                        .scan_raw_validated(
+                            &range,
+                            cur_cursor.as_ref(),
+                            ScanLimits {
+                                item_limit: page_items,
+                                byte_limit: page_bytes,
+                            },
+                        )
+                        .await?;
+                    for (k, v) in &items {
+                        gathered_bytes = gathered_bytes.saturating_add(k.len() + v.len());
+                    }
+                    gathered.append(&mut items);
+                    pages_read += 1;
+                    if nc.is_none()
+                        || pages_read >= 8
+                        || gathered_bytes >= batch_byte_cap
+                        || opened.elapsed() >= READ_SNAPSHOT_ROTATE_INTERVAL
+                    {
+                        return Ok(nc);
+                    }
+                    cur_cursor = nc;
                 }
             }
-            let (active_rtxn, _) = rtxn.as_mut().expect("snapshot open");
-            match active_rtxn
-                .scan_raw_validated(
-                    &range,
-                    cursor.as_ref(),
-                    ScanLimits {
-                        item_limit: page_items,
-                        byte_limit: page_bytes,
-                    },
-                )
-                .await
-            {
-                Ok(page) => break page,
+            .await;
+            drop(active_rtxn);
+
+            match scan_res {
+                Ok(nc) => break (gathered, nc),
                 Err(e) if e.kind() == ErrorKind::RetryableAbort => {
-                    rtxn = None;
                     env.retry
                         .wait_or_exhaust(Operation::PublishBulkBuild, &mut page_attempts)
                         .await?;
@@ -391,8 +392,19 @@ async fn scan_validation_slice<B: Backend>(
                             return Err(corrupt());
                         }
                         codec.decode(&lk, v.clone())?;
-                        count = count.checked_add(1).ok_or_else(corrupt)?;
-                        lt.add_assign(LtHash::from_kv(&k, &v));
+                        match lk {
+                            LogicalKey::Manifest(_)
+                            | LogicalKey::BuildDescriptor(_)
+                            | LogicalKey::BuildProgress(_)
+                            | LogicalKey::BuildUnit { .. } => {}
+                            LogicalKey::DrainHeader { .. } | LogicalKey::DrainSynopsis { .. } => {
+                                return Err(corrupt());
+                            }
+                            _ => {
+                                count = count.checked_add(1).ok_or_else(corrupt)?;
+                                lt.add_assign(LtHash::from_kv(&k, &v));
+                            }
+                        }
                     }
                     Ok((count, lt))
                 })
@@ -406,7 +418,6 @@ async fn scan_validation_slice<B: Backend>(
             None => break,
         }
     }
-    drop(rtxn);
     Ok(UnitOutput {
         kv_count: slice_count,
         kv_lthash: slice_lt,

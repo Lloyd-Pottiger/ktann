@@ -43,7 +43,8 @@ Call `Runtime::start_bulk_build(name, &input, options)` with
 `refinement_rounds` in `0..=5`; `None` preserves constructed centroids and
 `Some(0)` refreshes centroids without moves). Reservation atomically
 allocates a never-reused Logical Index ID, reserves `name`, and persists a
-`Building` `IndexManifest`, `BuildDescriptor`, and initial `BuildProgress`.
+`Building` `IndexManifest` and `BuildDescriptor` (`BuildProgress` is written
+when a worker claims an execution epoch).
 Repeating an identical request recovers that `BulkBuildJob`; `open_bulk_build(name)`
 recovers without source I/O. Ordinary `open_index`, reads, and mutations reject
 `Building` indexes with `IndexBuilding`.
@@ -53,11 +54,11 @@ recovers without source I/O. Ordinary `open_index`, reads, and mutations reject
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `workspace` | caller path | Existing directory for token-owned build state (`{workspace}/{hex_token}`) |
-| `parallelism` | `available_parallelism` (`1..=256`) | Local CPU and async unit concurrency per worker |
+| `parallelism` | `available_parallelism` (`1..=256`, default capped at `32`) | Local CPU and async unit concurrency per worker |
 | `distributed_workers` | `1` | Maximum concurrent worker processes collaborating on this job (`1..=256`) |
-| `unit_lease` | `30 s` | Renewable KV lease duration per `BuildUnit` (`10 ms ..= 365 days`) |
+| `unit_lease` | `30 s` | Renewable KV lease duration per `BuildUnit` (`10 ms ..= 365 days`, persisted losslessly as `(secs, nanos)`) |
 | `memory_bytes` | `512 MiB` | Per-worker working-memory budget (`> 0`, bounded per row/leaf at runtime) |
-| `graph_memory_bytes` | `256 MiB` | Per-internal-partition local HNSW build budget (`> 0`) |
+| `graph_memory_bytes` | `256 MiB` | Worker-wide concurrent local HNSW build memory ceiling (`> 0`) |
 | `scratch_bytes` | `64 GiB` | Per-build simultaneous workspace disk ceiling (`> 0`) |
 | `load` | `5,000` mutations / `4 MiB` | Max KV mutations and logical KV bytes per write transaction |
 
@@ -70,14 +71,15 @@ transient metadata reclamation. `job.run_worker(options)`, `job.publish()`, and
 
 ### 3.1 Deterministic `ShardPlan`
 
-From a uniform strided full-segment sample across all segments (`<= 32,768`
-items, bounded by `memory_bytes / 4` and selected deterministically by
-`xxh3_128(id)` min-sketch), `ShardPlan` computes:
+From a uniform strided full-segment sample across all segments (respecting
+`sample_items` and scaling up to `131,072` rows for large shard counts within
+`memory_bytes / 2`, selected deterministically by `xxh3_128(id)` min-sketch),
+`ShardPlan` computes:
 
 - **Quantile Record-ID splitters (`id_bounds`)** partitioning the ID space into
   non-overlapping buckets (`~16,384` records/bucket, up to `4,096` buckets) for
   global duplicate detection and sorted `RecordLocation` emission.
-- **Coarse Shards (`total_shards <= 65,536`, default target `16,384` rows/shard, lowered only when `memory_bytes` requires smaller shards)**:
+- **Coarse Shards (`total_shards <= 65,536`, default target `16,384` rows/shard, lowered when `memory_bytes` requires smaller shards)**:
   - *Heavy Tree Keys* (`estimated_rows > target_shard_rows`): split across `k`
     deterministic K-means coarse centers in serving routing space, globally
     bounded so all heavy and light shards fit within `65,536`. When `k >= 32`, a
@@ -85,8 +87,9 @@ items, bounded by `memory_bytes / 4` and selected deterministically by
     3-nearest candidate lists) keeps routing per vector at $O(\sqrt{k} \cdot D)$
     instead of $O(k \cdot D)$.
   - *Light Tree Keys*: hashed by `xxh3_64(tree_key)` into shared light Coarse
-    Shards (`<= 1,024`) so every light tree's records land in one shard without
-    creating one file per tenant.
+    Shards (scaling proportionally up to the remaining `65,536` shard budget) so
+    every light tree's records land in one shard without creating one file per
+    tenant.
 
 In disk/collaborative mode, the first worker persists `plan-e{epoch}.bin`
 atomically under `ScratchQuota` in the token-owned workspace so all workers share
@@ -115,28 +118,32 @@ constrained-memory or multi-worker builds (`StageStore::Disk`,
    self-contained `shard-e{epoch}-r0-*`, `centers-e{epoch}-r0-*`, and bucketed
    `(id, local_leaf)` indices (`loc-e{epoch}-r0-*`) in `StageStore`, and reclaims
    scatter vector runs.
-4. **Optional Halo Refinement (`Propose = 10+2r`, `Apply = 11+2r`)**:
-   `Some(0)` validates leaf-metadata memory admission without moves. For `1..=5`
+4. **Optional Halo Refinement (`Propose = 10+3r`, `Extract = 11+3r`, `Apply = 12+3r`)**:
+   `Some(0)` refreshes constructed leaf centroids without moves. For `1..=5`
    rounds on heavy trees, each shard scores its bounded halo neighborhood
-   (`score_halo_shard`, capped at `max_halo_leaves = min(32,768, memory_bytes / per_leaf)`)
+   (`score_halo_shard`, capped deterministically at
+   `max_halo_leaves = min(32,768, (memory_bytes / 2) / per_leaf)`)
    in canonical ascending shard order; `arbitrate_tree_proposals` selects
-   positive-gain capacity-safe moves, and `apply_round_shard` streams inbound
-   donor rows directly from round `r` shards in `StageStore`, compacts rows, and
-   recomputes dirty `f64` centroids into round `r + 1` before reclaiming round `r`.
+   positive-gain capacity-safe moves, `STAGE_REFINE_EXTRACT` packs cross-shard
+   outbound rows into indexed `out-e{epoch}-r{r}-*` slices so recipients never
+   re-read whole donor shards, and `apply_round_shard` consumes round `r` shards,
+   applies inbound slices, compacts rows, and recomputes dirty `f64` centroids
+   into round `r + 1` before reclaiming round `r`.
 5. **Serving KV Emission (`STAGE_EMIT_RECORDS = 30` -> `STAGE_EMIT_TREES = 31` -> `STAGE_EMIT_LEAVES = 32`)**:
    - Deterministic `PartitionKey`s are assigned per tree (`1` for a single-leaf
      root; otherwise `2 ..= 1 + total_leaves` for leaves and `1` for the upper
-     root, persisted to `leafkeys-e{epoch}.bin` in `Disk` mode).
+     root, persisted to `leafkeys-e{epoch}.bin` in `Disk` mode before reclaiming
+     early-converged proposal files).
    - `STAGE_EMIT_RECORDS` emits `[index, 0x01, escaped_id]` (`VectorRecord`,
      `RecordLocation`, and `OpaquePayload`) first in strict ascending ID-bucket
-     and Record-ID order, reading verified `InputSnapshot` frames in forward
-     per-segment offset order via `SegmentFileReader` and immediately reclaiming
-     `idref-*` and `loc-*`.
+     and Record-ID order, reading verified `InputSnapshot` frames at exact frame
+     offsets in per-segment order via `SegmentFileReader` and immediately
+     reclaiming `idref-*` and `loc-*`.
    - `STAGE_EMIT_TREES` reads non-root leaf centroids directly from `StageStore`
      (`centers-*` on disk, opening only shards with multi-leaf trees in the target
      bucket), groups internal levels bottom-up, builds partition-local HNSW graphs
-     directly from `&[ChildEntry]`, and emits `[0x03]` `TreeManifest` + `[0x04]`
-     internal partition KVs.
+     within the worker-wide `graph_memory_bytes` ceiling, and streams `[0x03]`
+     `TreeManifest` + `[0x04]` internal partition KVs in bounded node batches.
    - `STAGE_EMIT_LEAVES` expands `PartitionSynopsis` inline, emits `[0x04]` leaf
      `Header`, `Synopsis`, `State`, `Centroid`, and `LeafEntry` KVs in ascending
      `(tree_key, leaf_pk)` order, and reclaims final shard state immediately.
@@ -153,7 +160,7 @@ with zero intermediate `BuildUnit` KV writes.
 logical KV bytes per write transaction, additionally capped at `8 MiB` of
 estimated FoundationDB affected bytes (`3 * key_bytes + value_bytes + 64` per
 mutation plus conflict ranges) and the adapter's `AdmissionBudget`. Mutations
-are pipelined across up to 16 concurrent writer tasks that read-protect
+are pipelined across up to 8 concurrent writer tasks per worker that read-protect
 `BuildWorkspace.writer_token` with read-before-write warming so concurrent async
 writers overlap CPU encoding with backend commits without conflicting with one
 another or serializing on a single progress key.
@@ -178,18 +185,20 @@ heavy-tree partition ranges).
 `job.publish()` executes frozen backend validation (`src/runtime/bulk_publish.rs`):
 
 1. **Freeze writers**: `begin_validation` atomically transitions
-   `BuildProgress` to `Validating`, clears `BuildWorkspace.writer_token`
-   (permanently fencing any late worker transaction), and creates
-   `STAGE_VALIDATE (40)` slice `BuildUnit`s.
+   `BuildProgress` to `Validating` and clears `BuildWorkspace.writer_token`
+   (permanently fencing any late worker transaction), then `validate_all_slices`
+   initializes `STAGE_VALIDATE (40)` slice `BuildUnit`s within the effective
+   transaction budget.
 2. **Collaborative slice verification**: Workers claim incomplete
    `STAGE_VALIDATE (40)` slices (taking over expired slice leases cleanly), scan
-   disjoint `[split_i, split_{i+1})` ranges using short-lived `ReadTxn`s rotated
-   every `2 s` (preventing MVCC read-version expiry on FoundationDB), decode every
-   serving key and value through `keys::decode_key` and `ValueCodec::for_index`
-   (verifying canonical format, counts, and bounds), and commit slice entry counts
-   and `LtHash::from_kv` on each `BuildUnit` without contending on
-   `BuildProgress`. Any malformed, missing, extra, or modified byte in the frozen
-   backend fails closed with `ErrorKind::Corruption`.
+   disjoint `[split_i, split_{i+1})` ranges spanning the complete
+   `index_range(id)` (`[0x00..=0xFF]`) via short-lived `ReadTxn`s released before
+   CPU decoding, decode every index-scoped metadata and serving key/value through
+   `keys::decode_key` and `ValueCodec::for_index` (verifying canonical format,
+   counts, and bounds), and commit serving entry counts and `LtHash::from_kv` on
+   each `BuildUnit` without contending on `BuildProgress`. Any malformed, stray,
+   missing, extra, or modified byte anywhere in `index_range(id)` fails closed
+   with `ErrorKind::Corruption`.
 3. **Atomic activation**: Once $\sum_{\text{slices}} \text{count} = \text{total\_entries}$
    and $\sum_{\text{slices}} \text{kv\_lthash} = \text{expected\_kv\_lthash}$,
    one final transaction verifies the `Building` Manifest and `BuildDescriptor`
@@ -217,12 +226,12 @@ each participating process:
 `abort` transitions an unpublished `Building` Manifest to `Dropping` (conflict-aborting
 in-flight writers through their update-protected Manifest read), clears the
 index prefix and any `BuildSchedule` / `BuildScheduleSlot`s, and attempts workspace reclamation.
-Active indexes are never aborted. Post-publication `cleanup` reclaims transient
-`[0x07..0x08)` (`BuildUnit`s) while preserving `BuildDescriptor` (`0x05`) and
-compact `BuildProgress` (`0x06`, with split keys cleared on activation), verifies
-no peer worker slots remain active, acquires the exclusive advisory root lock to
-delete `{workspace}/{token}`, and removes the namespace-scoped `BuildWorkspace`
-and retired `BuildSchedule` / `BuildScheduleSlot` keys (`job.cleanup()` /
+Active indexes are never aborted. Post-publication `cleanup` first acquires the
+exclusive advisory root lock, verifies no peer worker slots remain active, deletes
+`{workspace}/{token}` and `BuildWorkspace`, retires any `BuildSchedule` /
+`BuildScheduleSlot` keys, and then reclaims transient `[0x07..0x08)` (`BuildUnit`s)
+while preserving `BuildDescriptor` (`0x05`) and compact `BuildProgress` (`0x06`,
+with split keys cleared on activation) (`job.cleanup()` /
 `Runtime::cleanup_bulk_builds`).
 
 ## 7. 10-Billion-Vector Scale Resource and Communication Model
@@ -233,11 +242,11 @@ filter field, cosine metric, local HNSW enabled):
 | Dimension | Bound / Formula | `10B` (`768D`) Value |
 | --- | --- | --- |
 | **Input Snapshot** | `610,352` segments (`16,384` rows, `~49 MiB` each); `segments.bin` = `29.3 MiB` | `~30.1 TiB` immutable segments; `O(1)`-FD segment reads |
-| **`ShardPlan` memory & I/O** | Uniform strided full-segment sample capped at `32,768` rows; `65,536` Coarse Shards (`~152,588` rows/shard) with `256` super-centers (`3` candidate lists, `~512` distance evals/vector) + `4,096` ID buckets | `~105 MiB` sample RAM; `plan.bin` = `201 MiB` (read once per worker) |
+| **`ShardPlan` memory & I/O** | Uniform strided full-segment sample scaling up to `131,072` rows; `65,536` Coarse Shards (`~152,588` rows/shard) with `256` super-centers (`3` candidate lists, `~512` distance evals/vector) + `4,096` ID buckets | `~410 MiB` max sample RAM; `plan.bin` = `201 MiB` (read once per worker) |
 | **Per-worker RAM (`W` workers, `P` threads/worker)** | Scatter/Leaf/Emit hold at most `P` Coarse Shards (`152,588 * ~3,200 B ≈ 488 MiB`/shard); Halo refinement caps at `max_halo_leaves = 32,768` (`~26` shards, `~105 MiB` centroids + HNSW) + `1` active shard (`~488 MiB`) | `2–4 GiB` RAM per worker (`O(1)` in dataset size $N$) |
-| **Intermediate coarse-shard storage** | Scatter (`vec-*` + `ids-*`): `~31.4 TiB`, consolidated into `65,536` self-contained `shard-*`, `centers-*`, and final-round compact `(id, local_leaf)` `loc-*` files (`vec-*` immediately deleted after `STAGE_LEAVES`) | Peak simultaneous scratch `~32–34 TiB` on shared object/file store (`~1.05x–1.15x` raw vectors) |
-| **Inter-worker coordination & KV metadata** | Workers share zero direct RPCs; coordination uses KV `BuildUnit` claims (`610k` scatter + `4k` dedup + `65.5k` leaf + `65.5k * 2R` refine + `70k` emit + `256` validate $\approx 1.01 \times 10^6$ units for `R = 2`, `< 290 MiB` transient KV metadata reclaimed on cleanup) | `< 350` lease/claim txns/sec across `64` workers (`30 s` lease) |
-| **Serving KV write transactions** | `~2.08 \times 10^{10}` serving KV records (`~64 TiB` logical bytes) batched at `4 MiB` / `5,000` mutations across 16 pipelined writer lanes | `~1.6 \times 10^7` write txns total (`~250k` txns/worker across `64` workers), zero whole-index serial bottleneck |
+| **Intermediate coarse-shard storage** | Scatter (`vec-*` + `ids-*`): `~31.4 TiB`, consolidated into `65,536` self-contained `shard-*`, `centers-*`, outbound donor slices `out-*`, and final-round compact `(id, local_leaf)` `loc-*` files (`vec-*` immediately deleted after `STAGE_LEAVES`) | Peak simultaneous scratch `~32–34 TiB` on shared object/file store (`~1.05x–1.15x` raw vectors) |
+| **Inter-worker coordination & KV metadata** | Workers share zero direct RPCs; coordination uses KV `BuildUnit` claims (`610k` scatter + `4k` dedup + `65.5k` leaf + `65.5k * 3R` refine + `70k` emit + `256` validate $\approx 1.14 \times 10^6$ units for `R = 2`, `< 330 MiB` transient KV metadata reclaimed on cleanup) | `< 350` lease/claim txns/sec across `64` workers (`30 s` lease) |
+| **Serving KV write transactions** | `~2.08 \times 10^{10}` serving KV records (`~64 TiB` logical bytes) batched at `4 MiB` / `5,000` mutations across up to 8 pipelined writer lanes per worker | `~1.6 \times 10^7` write txns total (`~250k` txns/worker across `64` workers), zero whole-index serial bottleneck |
 | **Upper-tree & HNSW construction** | `~1.0 \times 10^8` leaf centroids (`~307 GiB` across trees in `centers-*`, partitioned across `64` `tree_buckets`); for a single `10B` tree (`level 2`: `~15.6k` internal nodes of `~6,400` children; `level 3`: `1` root of `~15.6k` children), each internal node's local HNSW builds independently in `< 64 MiB` | Parallelized across `tree_buckets` and worker threads without global graph residency |
 
 ## 8. Verification

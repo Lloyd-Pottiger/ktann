@@ -342,6 +342,139 @@ async fn corrupt_input_segment_fails_closed_before_publication() {
     rt.shutdown().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sub_millisecond_unit_lease_and_tight_load_options_round_trip_across_collab_and_publish() {
+    let dir = tempfile::tempdir().unwrap();
+    let memory = MemoryBackend::with_test_config(TestConfig::default());
+    let rt1 = runtime(memory.clone());
+    let rt2 = runtime(memory.clone());
+    let (job1, _) = reservation(&rt1, &dir, 35).await;
+    let job2 = rt2.open_bulk_build("bulk").await.unwrap();
+
+    let work = dir.path().join("work");
+    fs::create_dir(&work).unwrap();
+    let mut opts = BulkWorkerOptions::new(work);
+    opts.distributed_workers = 2;
+    opts.parallelism = 2;
+    opts.unit_lease = Duration::from_micros(50_500);
+    opts.load = BulkLoadOptions {
+        max_mutations: 6,
+        max_bytes: 2048,
+    };
+
+    let (r1, r2) = tokio::join!(job1.run_worker(opts.clone()), job2.run_worker(opts.clone()));
+    r1.unwrap();
+    r2.unwrap();
+    // Re-running with the exact sub-millisecond `unit_lease` must match persisted options.
+    job1.run_worker(opts.clone()).await.unwrap();
+    for h in memory
+        .history()
+        .iter()
+        .filter(|h| h.outcome == CommitOutcome::Committed)
+    {
+        assert!(h.mutations <= opts.load.max_mutations);
+        assert!(h.mutation_bytes <= opts.load.max_bytes);
+    }
+
+    let index = job1.publish().await.unwrap();
+    let verified = index.verify(VerifyOptions::default()).await.unwrap();
+    assert!(verified.complete && verified.issues.is_empty());
+    assert_eq!(verified.objects.vector_records, 35);
+    rt1.shutdown().await.unwrap();
+    rt2.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publish_rejects_stray_keys_outside_serving_range_fail_closed() {
+    for stray_suffix in [&[0x00_u8, 0x99][..], &[0x09_u8][..]] {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = MemoryBackend::new();
+        let rt = runtime(memory.clone());
+        let (job, _) = reservation(&rt, &dir, 12).await;
+        let work = dir.path().join("work");
+        fs::create_dir(&work).unwrap();
+        job.run_worker(BulkWorkerOptions::new(work)).await.unwrap();
+
+        let mut raw_key = vec![0x01];
+        raw_key.extend_from_slice(&job.logical_index_id().get().to_be_bytes());
+        raw_key.extend_from_slice(stray_suffix);
+
+        let mut txn = memory.begin_write().await.unwrap();
+        txn.put(Bytes::from(raw_key.clone()), Bytes::from_static(b"stray"))
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+
+        assert_eq!(
+            job.publish().await.unwrap_err().kind(),
+            ErrorKind::Corruption
+        );
+        assert_eq!(
+            job.status().await.unwrap(),
+            BulkBuildStatus::Failed {
+                kind: ErrorKind::Corruption
+            }
+        );
+
+        let mut clean_txn = memory.begin_write().await.unwrap();
+        clean_txn.delete(Bytes::from(raw_key)).await.unwrap();
+        clean_txn.commit().await.unwrap();
+        job.abort().await.unwrap();
+        rt.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_in_flight_worker_future_cancels_background_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let memory = MemoryBackend::with_test_config(TestConfig::default());
+    let gate = Arc::new(Gate::default());
+    let rt = Runtime::new(
+        Gated {
+            memory: memory.clone(),
+            gate: gate.clone(),
+        },
+        RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
+    )
+    .unwrap();
+    let (job, _) = reservation(&rt, &dir, 40).await;
+    let work = dir.path().join("work");
+    fs::create_dir(&work).unwrap();
+    let mut opts = BulkWorkerOptions::new(work);
+    opts.parallelism = 1;
+    opts.load = load_options();
+
+    // Pause on commit #3 (after `claim` already committed and consumed `CancelBeforeCommit`).
+    gate.arm(3);
+    let fut_job = job.clone();
+    let fut_opts = opts.clone();
+    let mut worker_fut = Box::pin(async move { fut_job.run_worker(fut_opts).await });
+    tokio::select! {
+        res = &mut worker_fut => panic!("unexpected early completion: {res:?}"),
+        () = gate.wait() => {}
+    }
+    drop(worker_fut);
+    gate.release.notify_waiters();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Background execution must have stopped rather than sealing `Loaded`.
+    assert!(matches!(
+        job.status().await.unwrap(),
+        BulkBuildStatus::Loading { .. } | BulkBuildStatus::Preparing
+    ));
+    let index = job.complete(opts).await.unwrap();
+    assert_eq!(
+        index
+            .verify(VerifyOptions::default())
+            .await
+            .unwrap()
+            .objects
+            .vector_records,
+        40
+    );
+    rt.shutdown().await.unwrap();
+}
+
 #[path = "complete.rs"]
 mod complete;
 

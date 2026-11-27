@@ -141,11 +141,11 @@ pub enum LogicalKey {
         /// Zero-based worker slot (`0..distributed_workers`).
         slot: u32,
     },
-    /// Per-stage lease and completion record for one Bulk Build unit or fence lane.
+    /// Per-stage lease and completion record for one Bulk Build unit.
     BuildUnit {
         /// The owning Logical Index ID.
         index: LogicalIndexId,
-        /// Stage discriminator (`0` = writer fence lane, `1..` = execution/validation stages).
+        /// Stage discriminator (`1..` = execution stages, `40` = validation slices).
         stage: u8,
         /// Zero-based unit ordinal within `stage`.
         unit: u32,
@@ -658,7 +658,7 @@ fn namespace_build_key(kind: u8, index: LogicalIndexId) -> Vec<u8> {
     bytes
 }
 
-/// One stage-local Bulk Build unit or fence-lane key.
+/// One stage-local Bulk Build unit key.
 #[must_use]
 pub fn build_unit_key(index: LogicalIndexId, stage: u8, unit: u32) -> Vec<u8> {
     let mut bytes = index_prefix(index);
@@ -675,6 +675,20 @@ pub(crate) fn build_unit_stage_range(index: LogicalIndexId, stage: u8) -> KeyRan
     prefix.push(KIND_BUILD_UNIT);
     prefix.push(stage);
     KeyRange::for_prefix(prefix)
+}
+
+/// Contiguous range of `BuildUnit`s in one stage of `index` starting at `from_unit`.
+#[must_use]
+pub(crate) fn build_unit_stage_range_from(
+    index: LogicalIndexId,
+    stage: u8,
+    from_unit: u32,
+) -> KeyRange {
+    let full = build_unit_stage_range(index, stage);
+    if from_unit == 0 {
+        return full;
+    }
+    KeyRange::new(build_unit_key(index, stage, from_unit), full.end)
 }
 
 /// Contiguous serving-data range (`RecordGroup`, `TreeManifest`, and `Partition` keys
@@ -1135,6 +1149,16 @@ pub(crate) fn build_workspace_range(after: Option<LogicalIndexId>) -> KeyRange {
 /// Scheduled build records strictly after the supplied index ID.
 pub(crate) fn build_schedule_range(after: Option<LogicalIndexId>) -> KeyRange {
     namespace_build_range(NS_BUILD_SCHEDULE, after)
+}
+
+/// Collaborative scheduler slot records strictly after all slots of `after`.
+pub(crate) fn build_schedule_slot_all_range(after: Option<LogicalIndexId>) -> KeyRange {
+    let mut range = KeyRange::for_prefix(vec![SCOPE_NAMESPACE, NS_BUILD_SCHEDULE_SLOT]);
+    if let Some(index) = after {
+        range.start = build_schedule_slot_key(index, u32::MAX);
+        range.start.push(0);
+    }
+    range
 }
 
 /// Resume strictly after the last processed key, retaining the full namespace
