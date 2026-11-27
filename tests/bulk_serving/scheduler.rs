@@ -32,12 +32,24 @@ async fn wait_empty(memory: &MemoryBackend, id: LogicalIndexId) {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let mut txn = ReadLogicalTxn::bootstrap(memory.begin_read().await.unwrap());
-            if txn
+            let sched_empty = txn
                 .get(LogicalKey::BuildSchedule(id))
                 .await
                 .unwrap()
-                .is_none()
-            {
+                .is_none();
+            let mut slots_empty = true;
+            for slot in 0..4 {
+                if txn
+                    .get(LogicalKey::BuildScheduleSlot { index: id, slot })
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
+                    slots_empty = false;
+                    break;
+                }
+            }
+            if sched_empty && slots_empty {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -311,7 +323,7 @@ async fn renewal_prevents_takeover_while_preparation_is_paused() {
         }
     });
     gate.wait().await;
-    let before = read_queue(&memory, job.logical_index_id()).await;
+    let before = read_slot(&memory, job.logical_index_id()).await;
     let b = tokio::spawn({
         let runtime = second.clone();
         let stop = stop.clone();
@@ -325,13 +337,14 @@ async fn renewal_prevents_takeover_while_preparation_is_paused() {
         }
     });
     tokio::time::sleep(Duration::from_millis(4200)).await;
-    let after = read_queue(&memory, job.logical_index_id()).await;
+    let after = read_slot(&memory, job.logical_index_id()).await;
+    assert_ne!(&before[9..41], &[0; 32]);
     assert_eq!(
-        &before[before.len() - 40..before.len() - 8],
-        &after[after.len() - 40..after.len() - 8],
+        &before[9..41],
+        &after[9..41],
         "owner must be renewed, not replaced"
     );
-    assert!(after[after.len() - 8..] > before[before.len() - 8..]);
+    assert!(after[41..49] > before[41..49]);
     gate.release.notify_one();
     wait_active(&job).await;
     wait_empty(&memory, job.logical_index_id()).await;
@@ -348,6 +361,18 @@ async fn read_queue(memory: &MemoryBackend, id: LogicalIndexId) -> Vec<u8> {
         .await
         .unwrap()
         .get(ktann::storage::keys::build_schedule_key(id).into())
+        .await
+        .unwrap()
+        .unwrap()
+        .to_vec()
+}
+async fn read_slot(memory: &MemoryBackend, id: LogicalIndexId) -> Vec<u8> {
+    use ktann::storage::backend::ReadOps;
+    memory
+        .begin_read()
+        .await
+        .unwrap()
+        .get(ktann::storage::keys::build_schedule_slot_key(id, 0).into())
         .await
         .unwrap()
         .unwrap()
@@ -444,15 +469,23 @@ async fn discovery_passes_leased_entries_without_a_poll_per_entry() {
     second.schedule(options).await.unwrap();
     // A published job can retain its queue entry while its owner cleans up.
     // Keep those earlier entries leased throughout the discovery test.
-    let mut entry = read_queue(&memory, job.logical_index_id()).await;
-    let len = entry.len();
-    entry[len - 40..len - 8].fill(1);
-    entry[len - 8..].copy_from_slice(&u64::MAX.to_be_bytes());
+    let entry = read_queue(&memory, job.logical_index_id()).await;
+    let mut slot_bytes = vec![0_u8; 266];
+    slot_bytes[0] = 0x10;
+    slot_bytes[1..9].copy_from_slice(&1_u64.to_be_bytes());
+    slot_bytes[9..41].fill(1);
+    slot_bytes[41..49].copy_from_slice(&u64::MAX.to_be_bytes());
     let mut txn = memory.begin_write().await.unwrap();
     for id in leased {
         txn.put(
             keys::build_schedule_key(id).into(),
             Bytes::copy_from_slice(&entry),
+        )
+        .await
+        .unwrap();
+        txn.put(
+            keys::build_schedule_slot_key(id, 0).into(),
+            Bytes::copy_from_slice(&slot_bytes),
         )
         .await
         .unwrap();
@@ -578,7 +611,8 @@ async fn takeover_fences_a_scheduled_chunk_prepared_by_the_old_owner() {
     gate.wait().await;
     // Make this lease eligible without sleeping or allowing the old heartbeat
     // to race the fixture. The second Runtime performs the actual token takeover.
-    let key: Bytes = ktann::storage::keys::build_schedule_key(job.logical_index_id()).into();
+    let key: Bytes =
+        ktann::storage::keys::build_schedule_slot_key(job.logical_index_id(), 0).into();
     let mut txn = memory.begin_write().await.unwrap();
     let mut bytes = txn
         .get_for_update(key.clone())
@@ -586,8 +620,7 @@ async fn takeover_fences_a_scheduled_chunk_prepared_by_the_old_owner() {
         .unwrap()
         .unwrap()
         .to_vec();
-    let len = bytes.len();
-    bytes[len - 8..].copy_from_slice(&1_u64.to_be_bytes());
+    bytes[41..49].copy_from_slice(&1_u64.to_be_bytes());
     txn.put(key, bytes.into()).await.unwrap();
     txn.commit().await.unwrap();
     let b = tokio::spawn({
@@ -694,8 +727,8 @@ async fn separate_runtimes_progress_different_jobs_in_one_workspace() {
     // its queue claim for retry, before allowing the other worker to finish.
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            let queue = read_queue(&memory, two.logical_index_id()).await;
-            if queue[queue.len() - 40..queue.len() - 8] == [0; 32] {
+            let slot = read_slot(&memory, two.logical_index_id()).await;
+            if slot[9..41] == [0; 32] {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

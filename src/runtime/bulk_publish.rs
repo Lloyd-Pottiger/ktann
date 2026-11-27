@@ -18,11 +18,14 @@ use crate::storage::{LogicalRange, LogicalScanCursor, ReadLogicalTxn, WriteLogic
 
 use super::{
     OperationContext,
+    bulk_scheduler::authorize_raw,
     bulk_worker::{
         self, CommitStep,
-        bulk_pipeline::{StageEnv, StageFence, UnitOutput, drive_stage, fence_validation},
-        commit_raw_prepared, corrupt, effective_budget, lock_sched_read, retry_raw_write,
-        retry_read, validate_split_keys_in_index,
+        bulk_pipeline::{
+            StageEnv, StageFence, UnitOutput, drive_stage, fence_validation, init_stage_units,
+        },
+        corrupt, effective_budget, lock_sched_read, retry_ctx_write, retry_read,
+        validate_split_keys_in_index,
     },
     lifecycle::RetryPolicy,
 };
@@ -132,8 +135,7 @@ async fn read_active<T: ReadTxn>(
 }
 
 /// Pre-stages `STAGE_VALIDATE` `BuildUnit`s when `max_mutations` is smaller than `slices + 2`,
-/// then atomically clears `BuildWorkspace.writer_token` (revoking all writers) and flips
-/// `BuildProgress` from `Loaded` to `Validating`.
+/// then atomically clears `BuildWorkspace.writer_token` and flips `BuildProgress` to `Validating`.
 async fn begin_validation<B: Backend>(
     context: &mut OperationContext<B>,
     index: &IndexManifest,
@@ -184,183 +186,100 @@ async fn begin_validation<B: Backend>(
         return Ok(loaded_prog);
     }
 
-    let max_muts = context.backend().admission_budget().max_mutations;
-    let inline_all = max_muts >= (slices as usize + 2);
-    if !inline_all {
-        let per_batch = max_muts.saturating_sub(2).clamp(1, 256) as u32;
-        let backend = context.backend();
-        let control = context.options.clone();
-        let sched_lock = context.bulk_lease_lock.clone();
-        let bulk_authority = context.bulk_authority;
-        for batch_start in (0..slices).step_by(per_batch as usize) {
-            let batch_end = (batch_start + per_batch).min(slices);
-            retry_raw_write(
-                &control,
-                sched_lock.as_deref(),
-                Operation::PublishBulkBuild,
-                retry,
-                || async {
-                    let prepared = async {
-                        let mut txn = WriteLogicalTxn::bootstrap(
-                            backend.begin_write().await?,
-                            backend.hard_limits(),
-                            backend.admission_budget(),
-                        );
-                        bulk_worker::building_in_flight(&mut txn, index).await?;
-                        super::bulk_scheduler::authorize_raw(&mut txn, id, bulk_authority).await?;
-                        let p = match txn.get(LogicalKey::BuildProgress(id)).await? {
-                            Some(PersistentValue::BuildProgress(p)) => p,
-                            _ => return Err(corrupt()),
-                        };
-                        if p.epoch != state.epoch {
-                            return Err(Error::new(ErrorKind::BulkBuildSuperseded));
-                        }
-                        if p.phase == BuildPhase::Validating {
-                            txn.rollback().await;
-                            return Ok((None, ()));
-                        }
-                        if p.phase != BuildPhase::Loaded {
-                            return Err(Error::new(ErrorKind::BulkBuildBusy));
-                        }
-                        let mut any = false;
-                        for s in batch_start..batch_end {
-                            let ukey = LogicalKey::BuildUnit {
-                                index: id,
-                                stage: STAGE_VALIDATE,
-                                unit: s,
-                            };
-                            match txn.get_for_update(ukey.clone()).await? {
-                                Some(PersistentValue::BuildUnit(u)) if u.epoch == state.epoch => {}
-                                _ => {
-                                    txn.put(
-                                        ukey,
-                                        PersistentValue::BuildUnit(BuildUnit::unclaimed(
-                                            state.epoch,
-                                        )),
-                                    )
-                                    .await?;
-                                    any = true;
-                                }
-                            }
-                        }
-                        if !any {
-                            txn.rollback().await;
-                            return Ok((None, ()));
-                        }
-                        Ok((Some(txn), ()))
+    let budget = backend.admission_budget();
+    let inline_all = budget.max_mutations >= (slices as usize + 2);
+    let bulk_authority = context.bulk_authority;
+
+    retry_ctx_write(
+        context,
+        backend.as_ref(),
+        budget,
+        Operation::PublishBulkBuild,
+        retry,
+        |mut txn| async move {
+            bulk_worker::building_in_flight(&mut txn, index).await?;
+            authorize_raw(&mut txn, id, bulk_authority).await?;
+            let ws = txn.get_for_update(LogicalKey::BuildWorkspace(id)).await?;
+            match txn.get(LogicalKey::BuildDescriptor(id)).await? {
+                Some(PersistentValue::BuildDescriptor(d)) if d == *descriptor => {}
+                _ => return Err(corrupt()),
+            }
+            let progress = match txn.get_for_update(LogicalKey::BuildProgress(id)).await? {
+                None => return Err(Error::new(ErrorKind::BulkBuildBusy)),
+                Some(PersistentValue::BuildProgress(p)) => p,
+                _ => return Err(corrupt()),
+            };
+            let mut w = match ws {
+                Some(PersistentValue::BuildWorkspace(w)) => {
+                    if let Some(kind) = w.failure {
+                        return Err(Error::new(kind));
                     }
-                    .await;
-                    commit_raw_prepared(prepared).await
-                },
+                    if w.token != state.token
+                        || w.epoch != state.epoch
+                        || w.options != state.options
+                        || w.hard_limits != state.hard_limits
+                    {
+                        return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+                    }
+                    w
+                }
+                None if progress.phase == BuildPhase::Validating => return Err(corrupt()),
+                None => return Err(Error::new(ErrorKind::BulkBuildSuperseded)),
+                _ => return Err(corrupt()),
+            };
+            validate_split_keys_in_index(id, &progress.validation_split_keys)?;
+            if progress.total_records != descriptor.input().items() {
+                return Err(corrupt());
+            }
+            if progress.epoch != state.epoch {
+                return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+            }
+            match progress.phase {
+                BuildPhase::Preparing | BuildPhase::Loading => {
+                    return Err(Error::new(ErrorKind::BulkBuildBusy));
+                }
+                BuildPhase::Validating => {
+                    if w.writer_token != [0; 32] {
+                        return Err(corrupt());
+                    }
+                    txn.rollback().await;
+                    return Ok((None, progress));
+                }
+                BuildPhase::Loaded => {}
+            }
+
+            w.writer_token = [0; 32];
+            txn.put(
+                LogicalKey::BuildWorkspace(id),
+                PersistentValue::BuildWorkspace(w),
             )
             .await?;
-        }
-    }
-
-    let sched_lock = context.bulk_lease_lock.clone();
-    let mut attempts = 0;
-    loop {
-        let step = {
-            context.checkpoint()?;
-            let _sched_guard = lock_sched_read(&sched_lock).await;
-            let backend = context.backend();
-            let prepared = async {
-                let mut txn = WriteLogicalTxn::bootstrap(
-                    backend.begin_write().await?,
-                    backend.hard_limits(),
-                    backend.admission_budget(),
-                );
-                bulk_worker::building_in_flight(&mut txn, index).await?;
-                super::bulk_scheduler::authorize(context, &mut txn, id).await?;
-                let ws = txn.get_for_update(LogicalKey::BuildWorkspace(id)).await?;
-                match txn.get(LogicalKey::BuildDescriptor(id)).await? {
-                    Some(PersistentValue::BuildDescriptor(d)) if d == *descriptor => {}
-                    _ => return Err(corrupt()),
+            if inline_all {
+                for s in 0..slices {
+                    txn.put(
+                        LogicalKey::BuildUnit {
+                            index: id,
+                            stage: STAGE_VALIDATE,
+                            unit: s,
+                        },
+                        PersistentValue::BuildUnit(BuildUnit::unclaimed(progress.epoch)),
+                    )
+                    .await?;
                 }
-                let progress = match txn.get_for_update(LogicalKey::BuildProgress(id)).await? {
-                    None => return Err(Error::new(ErrorKind::BulkBuildBusy)),
-                    Some(PersistentValue::BuildProgress(p)) => p,
-                    _ => return Err(corrupt()),
-                };
-                let mut w = match ws {
-                    Some(PersistentValue::BuildWorkspace(w)) => {
-                        if let Some(kind) = w.failure {
-                            return Err(Error::new(kind));
-                        }
-                        if w.token != state.token
-                            || w.epoch != state.epoch
-                            || w.options != state.options
-                            || w.hard_limits != state.hard_limits
-                        {
-                            return Err(Error::new(ErrorKind::BulkBuildSuperseded));
-                        }
-                        w
-                    }
-                    None if progress.phase == BuildPhase::Validating => return Err(corrupt()),
-                    None => return Err(Error::new(ErrorKind::BulkBuildSuperseded)),
-                    _ => return Err(corrupt()),
-                };
-                validate_split_keys_in_index(id, &progress.validation_split_keys)?;
-                if progress.total_records != descriptor.input().items() {
-                    return Err(corrupt());
-                }
-                if progress.epoch != state.epoch {
-                    return Err(Error::new(ErrorKind::BulkBuildSuperseded));
-                }
-                match progress.phase {
-                    BuildPhase::Preparing | BuildPhase::Loading => {
-                        return Err(Error::new(ErrorKind::BulkBuildBusy));
-                    }
-                    BuildPhase::Validating => {
-                        if w.writer_token != [0; 32] {
-                            return Err(corrupt());
-                        }
-                        txn.rollback().await;
-                        return Ok((None, progress));
-                    }
-                    BuildPhase::Loaded => {}
-                }
-
-                w.writer_token = [0; 32];
-                txn.put(
-                    LogicalKey::BuildWorkspace(id),
-                    PersistentValue::BuildWorkspace(w),
-                )
-                .await?;
-                if inline_all {
-                    for s in 0..slices {
-                        txn.put(
-                            LogicalKey::BuildUnit {
-                                index: id,
-                                stage: STAGE_VALIDATE,
-                                unit: s,
-                            },
-                            PersistentValue::BuildUnit(BuildUnit::unclaimed(progress.epoch)),
-                        )
-                        .await?;
-                    }
-                }
-                let next = BuildProgress {
-                    phase: BuildPhase::Validating,
-                    ..progress
-                };
-                txn.put(
-                    LogicalKey::BuildProgress(id),
-                    PersistentValue::BuildProgress(next.clone()),
-                )
-                .await?;
-                Ok((Some(txn), next))
             }
-            .await;
-            context.commit_prepared(prepared).await
-        };
-        if let Some(next) = step
-            .resolve(Operation::PublishBulkBuild, retry, &mut attempts)
-            .await?
-        {
-            return Ok(next);
-        }
-    }
+            let next = BuildProgress {
+                phase: BuildPhase::Validating,
+                ..progress
+            };
+            txn.put(
+                LogicalKey::BuildProgress(id),
+                PersistentValue::BuildProgress(next.clone()),
+            )
+            .await?;
+            Ok((Some(txn), next))
+        },
+    )
+    .await
 }
 
 fn slice_logical_range(
@@ -421,6 +340,9 @@ async fn validate_all_slices<B: Backend>(
         retry,
     };
 
+    if context.backend().admission_budget().max_mutations < (slices as usize + 2) {
+        init_stage_units(&env, STAGE_VALIDATE, slices).await?;
+    }
     drive_stage(&env, STAGE_VALIDATE, slices, concurrency, {
         let env = env.clone();
         move |slice, _lease| {
@@ -642,7 +564,7 @@ async fn activate<B: Backend>(
                 }
                 let cur_prog =
                     fence_validation(&mut txn, index, state.token, progress.epoch).await?;
-                super::bulk_scheduler::authorize(context, &mut txn, id).await?;
+                authorize_raw(&mut txn, id, context.bulk_authority).await?;
                 match txn.get(LogicalKey::BuildDescriptor(id)).await? {
                     Some(PersistentValue::BuildDescriptor(d)) if d == *descriptor => {}
                     _ => return Err(corrupt()),

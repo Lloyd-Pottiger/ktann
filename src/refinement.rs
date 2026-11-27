@@ -169,33 +169,6 @@ pub(crate) fn finish_mean(
     PartitionCentroid::with_dispersion(kernel.normalize_centroid(&center)?, dispersion)
 }
 
-/// Parallel variant of [`leaf_neighbors`] for Bulk Build workers, bounded by `memory_limit_bytes`.
-pub(crate) fn leaf_neighbors_parallel(
-    checkpoint: &(dyn Fn() -> Result<()> + Sync),
-    kernel: &VectorKernel,
-    leaves: &[impl LeafCenter + Sync],
-    parallelism: usize,
-    memory_limit_bytes: usize,
-) -> Result<Vec<LeafNeighbors>> {
-    if hnsw::enabled(leaves.len()) {
-        return hnsw::neighbors_parallel(
-            checkpoint,
-            kernel,
-            leaves,
-            parallelism,
-            memory_limit_bytes,
-        );
-    }
-    let needed = leaves
-        .len()
-        .checked_mul(std::mem::size_of::<LeafNeighbors>())
-        .ok_or_else(|| crate::api::Error::new(crate::api::ErrorKind::LimitExceeded))?;
-    if needed > memory_limit_bytes {
-        return Err(crate::api::Error::new(crate::api::ErrorKind::LimitExceeded));
-    }
-    leaf_neighbors(&checkpoint, kernel, leaves)
-}
-
 /// Retains up to 32 candidate leaves in exact `(distance, leaf ordinal)` order.
 /// Large trees use a centroid HNSW; small trees score each symmetric pair once,
 /// updating both ends. Only the bounded neighbor lists survive; no quadratic

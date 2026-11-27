@@ -228,8 +228,7 @@ preparation directory, worker options, active writer-fence token, epoch, and ter
 It survives removal of the index prefix until exclusive-lock cleanup completes.
 
 **Build Schedule**: Namespace-scoped durable request for automatic execution of
-one Bulk Build Job. It fixes worker options (including `distributed_workers`) and the original name/ID and coordinates
-renewable peer slot leases (`LogicalKey::BuildScheduleSlot` when `distributed_workers > 1`). A committed token change
+one Bulk Build Job. It fixes worker options (including `distributed_workers`) and the original name/ID, while worker ownership leases live in `LogicalKey::BuildScheduleSlot` (`slot = 0..distributed_workers`). A committed token change
 fences superseded writers; time alone is not write authority. It is separate
 from scratch-directory ownership in Build Workspace and retires after workspace reclamation
 or a persisted terminal job failure.

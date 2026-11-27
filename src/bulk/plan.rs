@@ -614,27 +614,41 @@ fn score_batch_4(kernel: &VectorKernel, vector: &[f32], batch: &[&[f32]]) -> [f6
     }
 }
 
-pub(crate) fn nearest_center(
+fn nearest_by(
     kernel: &VectorKernel,
     vector: &[f32],
     centers: &[Box<[f32]>],
+    indices: Option<&[u32]>,
 ) -> usize {
-    let mut best = 0;
+    let len = indices.map_or(centers.len(), <[u32]>::len);
+    let idx_at = |pos: usize| indices.map_or(pos, |ix| ix[pos] as usize);
+    let mut best = idx_at(0);
     let mut best_dist = f64::INFINITY;
-    for (chunk_idx, chunk) in centers.chunks(4).enumerate() {
+    for chunk_start in (0..len).step_by(4) {
+        let chunk_len = (len - chunk_start).min(4);
         let mut refs: [&[f32]; 4] = [&[]; 4];
-        for (dst, c) in refs.iter_mut().zip(chunk) {
-            *dst = c;
+        for (lane, dst) in refs.iter_mut().take(chunk_len).enumerate() {
+            *dst = &centers[idx_at(chunk_start + lane)];
         }
-        let dists = score_batch_4(kernel, vector, &refs[..chunk.len()]);
-        for (lane, candidate) in dists.into_iter().take(chunk.len()).enumerate() {
-            if candidate.total_cmp(&best_dist).is_lt() {
-                best = chunk_idx * 4 + lane;
+        let dists = score_batch_4(kernel, vector, &refs[..chunk_len]);
+        for (lane, candidate) in dists.into_iter().take(chunk_len).enumerate() {
+            let idx = idx_at(chunk_start + lane);
+            let ord = candidate.total_cmp(&best_dist);
+            if ord.is_lt() || (ord.is_eq() && idx < best) {
+                best = idx;
                 best_dist = candidate;
             }
         }
     }
     best
+}
+
+pub(crate) fn nearest_center(
+    kernel: &VectorKernel,
+    vector: &[f32],
+    centers: &[Box<[f32]>],
+) -> usize {
+    nearest_by(kernel, vector, centers, None)
 }
 
 fn nearest_indexed_center(
@@ -643,24 +657,7 @@ fn nearest_indexed_center(
     centers: &[Box<[f32]>],
     indices: &[u32],
 ) -> u32 {
-    let mut best = indices[0];
-    let mut best_dist = f64::INFINITY;
-    for chunk in indices.chunks(4) {
-        let mut refs: [&[f32]; 4] = [&[]; 4];
-        for (dst, &idx) in refs.iter_mut().zip(chunk) {
-            *dst = &centers[idx as usize];
-        }
-        let dists = score_batch_4(kernel, vector, &refs[..chunk.len()]);
-        for (&idx, candidate) in chunk.iter().zip(dists) {
-            if candidate.total_cmp(&best_dist).is_lt()
-                || (candidate.total_cmp(&best_dist).is_eq() && idx < best)
-            {
-                best = idx;
-                best_dist = candidate;
-            }
-        }
-    }
-    best
+    nearest_by(kernel, vector, centers, Some(indices)) as u32
 }
 
 /// Two-level hierarchical K-means when `k > 64` so large shard counts (`k <= 65,535`)

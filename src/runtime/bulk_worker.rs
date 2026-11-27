@@ -111,6 +111,45 @@ pub(crate) async fn lock_sched_read(
     }
 }
 
+/// Executes a context-managed bootstrap write transaction with scheduler read-lock protection and retries.
+pub(crate) async fn retry_ctx_write<'b, B, T, F, Fut>(
+    context: &mut OperationContext<B>,
+    backend: &'b B,
+    budget: AdmissionBudget,
+    op: Operation,
+    retry: RetryPolicy,
+    mut prepare: F,
+) -> Result<T>
+where
+    B: Backend,
+    F: FnMut(WriteLogicalTxn<'b, B::WriteTxn<'b>>) -> Fut,
+    Fut: Future<Output = Result<(Option<WriteLogicalTxn<'b, B::WriteTxn<'b>>>, T)>>,
+{
+    let sched_lock = context.bulk_lease_lock.clone();
+    let mut attempts = 0;
+    loop {
+        let step = {
+            context.checkpoint()?;
+            let _sched_guard = lock_sched_read(&sched_lock).await;
+            let prepared = match backend.begin_write().await {
+                Ok(raw) => {
+                    prepare(WriteLogicalTxn::bootstrap(
+                        raw,
+                        backend.hard_limits(),
+                        budget,
+                    ))
+                    .await
+                }
+                Err(e) => Err(e),
+            };
+            context.commit_prepared(prepared).await
+        };
+        if let Some(done) = step.resolve(op, retry, &mut attempts).await? {
+            return Ok(done);
+        }
+    }
+}
+
 /// Executes a non-context write transaction step with scheduler read-lock protection and retries.
 pub(crate) async fn retry_raw_write<T, F, Fut>(
     control: &OperationOptions,
@@ -308,12 +347,15 @@ where
         return work(context).await;
     };
     let backend = context.backend();
-    let auth = BulkAuthority::UnscheduledPeer { slot, owner };
-    let dist = options.distributed_workers;
+    let auth = BulkAuthority {
+        slot,
+        owner,
+        scheduled: false,
+    };
     let lease = options.unit_lease;
     let outcome = tokio::select! {
         res = work(context) => res,
-        err = run_authority_lease_renewals(backend, lease_lock, id, auth, dist, lease, initial_exp) => Err(err),
+        err = run_authority_lease_renewals(backend, lease_lock, id, auth, lease, initial_exp) => Err(err),
     };
     release_unscheduled_peer_slot(context, id, slot, owner, retry).await?;
     outcome
@@ -1046,36 +1088,30 @@ async fn clear_index_range<B: Backend>(
     budget: AdmissionBudget,
     retry: RetryPolicy,
 ) -> Result<()> {
-    let sched_lock = context.bulk_lease_lock.clone();
     let bulk_authority = context.bulk_authority;
-    if context.backend().capabilities().transactional_clear_range {
-        let mut attempts = 0;
-        loop {
-            let step = {
-                context.checkpoint()?;
-                let _sched_guard = lock_sched_read(&sched_lock).await;
-                let backend = context.backend();
-                let prepared = async {
-                    let mut txn = WriteLogicalTxn::for_index(
-                        backend.begin_write().await?,
-                        index,
-                        backend.hard_limits(),
-                        backend.admission_budget(),
-                    );
-                    if !check_range_clear_guard(&mut txn, index, bulk_authority, guard).await? {
-                        txn.rollback().await;
-                        return Ok::<_, Error>((None, ()));
-                    }
-                    txn.clear_range(&range).await?;
-                    Ok((Some(txn), ()))
+    let backend = context.backend();
+    let hard_limits = backend.hard_limits();
+    let range_ref = &range;
+    if backend.capabilities().transactional_clear_range {
+        let adm = backend.admission_budget();
+        return retry_ctx_write(
+            context,
+            backend.as_ref(),
+            adm,
+            op,
+            retry,
+            |raw_boot| async move {
+                let mut txn =
+                    WriteLogicalTxn::for_index(raw_boot.into_raw(), index, hard_limits, adm);
+                if !check_range_clear_guard(&mut txn, index, bulk_authority, guard).await? {
+                    txn.rollback().await;
+                    return Ok::<_, Error>((None, ()));
                 }
-                .await;
-                context.commit_prepared(prepared).await
-            };
-            if step.resolve(op, retry, &mut attempts).await?.is_some() {
-                return Ok(());
-            }
-        }
+                txn.clear_range(range_ref).await?;
+                Ok((Some(txn), ()))
+            },
+        )
+        .await;
     }
 
     let max_del_muts = budget.max_mutations.max(1);
@@ -1083,11 +1119,9 @@ async fn clear_index_range<B: Backend>(
     let mut cursor = None;
     loop {
         context.checkpoint()?;
-        let backend = context.backend();
         let page = retry_read(&context.options, op, retry, || {
             let backend = Arc::clone(&backend);
             let cursor_ref = cursor.clone();
-            let range_ref = &range;
             async move {
                 let mut rtxn = ReadLogicalTxn::for_index(backend.begin_read().await?, index);
                 rtxn.scan(
@@ -1111,39 +1145,31 @@ async fn clear_index_range<B: Backend>(
             budget,
         )?;
         for batch_keys in del_batches {
-            let mut attempts = 0;
-            loop {
-                let step = {
-                    context.checkpoint()?;
-                    let _sched_guard = lock_sched_read(&sched_lock).await;
-                    let backend = context.backend();
-                    let prepared = async {
-                        let mut txn = WriteLogicalTxn::for_index(
-                            backend.begin_write().await?,
-                            index,
-                            backend.hard_limits(),
-                            budget,
-                        );
-                        if !check_range_clear_guard(&mut txn, index, bulk_authority, guard).await? {
-                            txn.rollback().await;
-                            return Ok::<_, Error>((None, false));
-                        }
-                        let mut batch = txn.mutations();
-                        for lk in &batch_keys {
-                            batch.delete(lk.clone())?;
-                        }
-                        txn.apply(batch).await?;
-                        Ok((Some(txn), true))
+            let batch_ref = &batch_keys;
+            let proceed = retry_ctx_write(
+                context,
+                backend.as_ref(),
+                budget,
+                op,
+                retry,
+                |raw_boot| async move {
+                    let mut txn =
+                        WriteLogicalTxn::for_index(raw_boot.into_raw(), index, hard_limits, budget);
+                    if !check_range_clear_guard(&mut txn, index, bulk_authority, guard).await? {
+                        txn.rollback().await;
+                        return Ok::<_, Error>((None, false));
                     }
-                    .await;
-                    context.commit_prepared(prepared).await
-                };
-                if let Some(proceed) = step.resolve(op, retry, &mut attempts).await? {
-                    if !proceed {
-                        return Ok(());
+                    let mut batch = txn.mutations();
+                    for lk in batch_ref {
+                        batch.delete(lk.clone())?;
                     }
-                    break;
-                }
+                    txn.apply(batch).await?;
+                    Ok((Some(txn), true))
+                },
+            )
+            .await?;
+            if !proceed {
+                return Ok(());
             }
         }
         match next_cursor {
@@ -1405,67 +1431,57 @@ pub(crate) async fn seal_loaded<B: Backend>(
 ) -> Result<()> {
     let id = index.logical_index_id();
     validate_split_keys_in_index(id, &validation_split_keys)?;
-    let sched_lock = context.bulk_lease_lock.clone();
-    let mut attempts = 0;
-    loop {
-        let step = {
-            context.checkpoint()?;
-            let _sched_guard = lock_sched_read(&sched_lock).await;
-            let backend = context.backend();
-            let prepared = async {
-                let mut txn = WriteLogicalTxn::bootstrap(
-                    backend.begin_write().await?,
-                    backend.hard_limits(),
-                    backend.admission_budget(),
-                );
-                check_writer_fence(&mut txn, index, fence).await?;
-                super::bulk_scheduler::authorize(context, &mut txn, id).await?;
+    let backend = context.backend();
+    let budget = backend.admission_budget();
+    let auth = context.bulk_authority;
+    let split_ref = &validation_split_keys;
 
-                let cur = match txn.get_for_update(LogicalKey::BuildProgress(id)).await? {
-                    Some(PersistentValue::BuildProgress(p)) => p,
-                    _ => return Err(corrupt()),
-                };
-                if cur.phase == BuildPhase::Loaded
-                    && cur.epoch == fence.epoch
-                    && cur.total_entries == total_entries
-                    && cur.expected_kv_lthash == expected_kv_lthash
-                {
-                    txn.rollback().await;
-                    return Ok((None, ()));
-                }
-                if cur.phase == BuildPhase::Validating || cur.epoch != fence.epoch {
-                    return Err(Error::new(ErrorKind::BulkBuildSuperseded));
-                }
+    retry_ctx_write(
+        context,
+        backend.as_ref(),
+        budget,
+        Operation::RunBulkBuild,
+        retry,
+        |mut txn| async move {
+            check_writer_fence(&mut txn, index, fence).await?;
+            authorize_raw(&mut txn, id, auth).await?;
 
-                let next = BuildProgress {
-                    phase: BuildPhase::Loaded,
-                    epoch: fence.epoch,
-                    loaded_entries: total_entries,
-                    total_entries,
-                    total_records,
-                    trees,
-                    partitions,
-                    expected_kv_lthash,
-                    validation_split_keys: validation_split_keys.clone(),
-                };
-                txn.put(
-                    LogicalKey::BuildProgress(id),
-                    PersistentValue::BuildProgress(next),
-                )
-                .await?;
-                Ok((Some(txn), ()))
+            let cur = match txn.get_for_update(LogicalKey::BuildProgress(id)).await? {
+                Some(PersistentValue::BuildProgress(p)) => p,
+                _ => return Err(corrupt()),
+            };
+            if cur.phase == BuildPhase::Loaded
+                && cur.epoch == fence.epoch
+                && cur.total_entries == total_entries
+                && cur.expected_kv_lthash == expected_kv_lthash
+            {
+                txn.rollback().await;
+                return Ok((None, ()));
             }
-            .await;
-            context.commit_prepared(prepared).await
-        };
-        if step
-            .resolve(Operation::RunBulkBuild, retry, &mut attempts)
-            .await?
-            .is_some()
-        {
-            return Ok(());
-        }
-    }
+            if cur.phase == BuildPhase::Validating || cur.epoch != fence.epoch {
+                return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+            }
+
+            let next = BuildProgress {
+                phase: BuildPhase::Loaded,
+                epoch: fence.epoch,
+                loaded_entries: total_entries,
+                total_entries,
+                total_records,
+                trees,
+                partitions,
+                expected_kv_lthash,
+                validation_split_keys: split_ref.clone(),
+            };
+            txn.put(
+                LogicalKey::BuildProgress(id),
+                PersistentValue::BuildProgress(next),
+            )
+            .await?;
+            Ok((Some(txn), ()))
+        },
+    )
+    .await
 }
 
 /// Persists terminal failures for the current workspace epoch; transient errors,
@@ -1661,71 +1677,65 @@ pub(crate) async fn cleanup<B: Backend>(
         }
     };
 
-    let sched_lock = context.bulk_lease_lock.clone();
-    let mut attempts = 0;
-    loop {
-        let step = {
-            context.checkpoint()?;
-            let _sched_guard = lock_sched_read(&sched_lock).await;
-            let backend = context.backend();
-            let prepared = async {
-                let mut txn = WriteLogicalTxn::bootstrap(
-                    backend.begin_write().await?,
-                    backend.hard_limits(),
-                    backend.admission_budget(),
-                );
-                if let Some(value) = txn.get_for_update(LogicalKey::Manifest(id)).await? {
-                    match value {
-                        PersistentValue::IndexManifest(m)
-                            if m.logical_index_id() == id
-                                && m.lifecycle() != IndexLifecycle::Building => {}
-                        _ => return Err(Error::invalid_argument()),
-                    }
+    let auth = context.bulk_authority;
+    let adm = context.cpu_keep_alive();
+    let adm_ref = &adm;
+    let budget = backend.admission_budget();
+    let state_ref = &state;
+    let lock_ref = &lock;
+    retry_ctx_write(
+        context,
+        backend.as_ref(),
+        budget,
+        Operation::CleanupBulkBuild,
+        retry,
+        |mut txn| async move {
+            if let Some(value) = txn.get_for_update(LogicalKey::Manifest(id)).await? {
+                match value {
+                    PersistentValue::IndexManifest(m)
+                        if m.logical_index_id() == id
+                            && m.lifecycle() != IndexLifecycle::Building => {}
+                    _ => return Err(Error::invalid_argument()),
                 }
-                ensure_no_peer_scheduler_leases(
-                    context,
-                    &mut txn,
-                    id,
-                    state.options.distributed_workers,
-                )
-                .await?;
-                let key = LogicalKey::BuildWorkspace(id);
-                match txn.get_for_update(key.clone()).await? {
-                    None => {
-                        txn.rollback().await;
-                        return Ok((None, ()));
-                    }
-                    Some(PersistentValue::BuildWorkspace(w)) if w == state => {}
-                    _ => return Err(corrupt()),
-                }
-                let path = state.directory();
-                let lock = lock.clone();
-                blocking(context, move || {
-                    let _lock = lock;
-                    match fs::remove_dir_all(&path) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(io(e)),
-                    };
-                    File::open(path.parent().expect("root"))
-                        .and_then(|f| f.sync_all())
-                        .map_err(io)
-                })
-                .await?;
-                txn.delete(key).await?;
-                Ok((Some(txn), ()))
             }
-            .await;
-            context.commit_prepared(prepared).await
-        };
-        if step
-            .resolve(Operation::CleanupBulkBuild, retry, &mut attempts)
-            .await?
-            .is_some()
-        {
-            break;
-        }
-    }
+            ensure_no_peer_scheduler_leases(
+                auth,
+                &mut txn,
+                id,
+                state_ref.options.distributed_workers,
+            )
+            .await?;
+            let key = LogicalKey::BuildWorkspace(id);
+            match txn.get_for_update(key.clone()).await? {
+                None => {
+                    txn.rollback().await;
+                    return Ok((None, ()));
+                }
+                Some(PersistentValue::BuildWorkspace(w)) if &w == state_ref => {}
+                _ => return Err(corrupt()),
+            }
+            let path = state_ref.directory();
+            let guard = Arc::clone(lock_ref);
+            let keep_alive = adm_ref.clone();
+            tokio::task::spawn_blocking(move || {
+                let _adm = keep_alive;
+                let _lock = guard;
+                match fs::remove_dir_all(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(io(e)),
+                };
+                File::open(path.parent().expect("root"))
+                    .and_then(|f| f.sync_all())
+                    .map_err(io)
+            })
+            .await
+            .map_err(|e| Error::with_source(ErrorKind::Other, e))??;
+            txn.delete(key).await?;
+            Ok((Some(txn), ()))
+        },
+    )
+    .await?;
 
     drop(lock);
     retire_orphaned_schedule(context, id, retry).await

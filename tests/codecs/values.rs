@@ -1133,8 +1133,6 @@ fn build_schedule_golden_and_malformed_lease() {
     for n in [1_u64, 1, 10, 1, 1, 1, 2, 1] {
         golden.extend_from_slice(&n.to_be_bytes());
     }
-    golden.extend_from_slice(&[1; 32]);
-    golden.extend_from_slice(&1_u64.to_be_bytes());
     let value = codec.decode(&key, Bytes::from(golden.clone())).unwrap();
     assert_eq!(codec.encode(&value).unwrap(), golden);
     for length in 0..golden.len() {

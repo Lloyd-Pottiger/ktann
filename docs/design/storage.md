@@ -278,22 +278,21 @@ Bulk Build persists six logical key families:
   writer-fence token (`[0; 32]` once frozen for validation), attempt epoch, and
   terminal failure. Its namespace scope lets cleanup survive index deletion.
 - **Build Unit** (`0x07`, value `0x10`, keyed by `(index, stage, unit)`) records
-  disk stage work units (`stage = 1..32`, including `Propose = 10+3r`,
-  `Extract = 11+3r`, `Apply = 12+3r`) and parallel validation slices
+  disk stage work units (`stage = 1..32`, including `Propose = 10+2r` and
+  `Apply = 11+2r`) and parallel validation slices
   (`stage = 40`), carrying the build epoch, renewable worker owner token/expiry,
   completion flag, counts, and 512-bit `LtHash` digests. Post-publication
   cleanup reclaims `[0x07..0x08)` (`BuildUnit`s) while compact
   `BuildDescriptor` (`0x05`) and `BuildProgress` (`0x06`, with
   `validation_split_keys` cleared on activation) remain attached for idempotent
   status and report counts until index drop.
-- **Build Schedule** (namespace `[0,3] || id`, value `0x11`) records automatic
-  execution options (including `distributed_workers`) and a renewable owner token.
-  A committed token change fences superseded writers; expiry alone does not
-  revoke authority.
+- **Build Schedule** (namespace `[0,3] || id`, value `0x11`) records the queued
+  index name and automatic execution options (including `distributed_workers`).
 - **Build Schedule Slot** (namespace `[0,4] || id || slot`, value `0x10`) records
-  renewable collaborative worker slot leases (`slot = 0..distributed_workers`)
-  outside the index prefix so index drop or post-publication cleanup never leaves
-  orphaned scheduler or worker slot keys.
+  renewable worker slot leases (`slot = 0..distributed_workers`) for both
+  single-worker and collaborative scheduled or peer builds outside the index
+  prefix so a committed token change fences superseded writers and index drop or
+  post-publication cleanup never leaves orphaned scheduler or worker slot keys.
 
 Build metadata Debug output redacts source/workspace locators, validation split
 keys, worker options, and ownership tokens.
