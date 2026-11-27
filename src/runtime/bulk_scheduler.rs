@@ -352,8 +352,10 @@ pub(crate) async fn release_unscheduled_peer_slot<B: Backend>(
     context.bulk_authority = None;
     context.bulk_lease_lock = None;
     let backend = context.backend();
+    let release_ctrl = OperationOptions::default()
+        .with_deadline(std::time::Instant::now() + Duration::from_secs(2));
     let _ = bulk_worker::retry_raw_write(
-        &context.options,
+        &release_ctrl,
         None,
         Operation::RunBulkBuild,
         retry,
@@ -784,89 +786,108 @@ async fn finish<B: Backend>(
     };
     let backend = context.backend();
     let budget = backend.admission_budget();
+    // Use a short uncancelled deadline so graceful scheduler shutdown or cancellation
+    // still releases or retires this worker's `BuildScheduleSlot` lease cleanly.
+    let finish_ctrl = OperationOptions::default()
+        .with_deadline(std::time::Instant::now() + Duration::from_secs(2));
 
-    bulk_worker::retry_ctx_write(
-        context,
-        backend.as_ref(),
-        budget,
+    bulk_worker::retry_raw_write(
+        &finish_ctrl,
+        None,
         Operation::ScheduleBulkBuild,
         retry,
-        |mut txn| async move {
-            let key = LogicalKey::BuildSchedule(id);
-            let ws_opt = txn.get(LogicalKey::BuildWorkspace(id)).await?;
-            let failed = matches!(
-                &ws_opt,
-                Some(PersistentValue::BuildWorkspace(w)) if w.failure.is_some()
-            );
-            let ws_reclaimed = ws_opt.is_none();
-            let Some(val) = txn.get_for_update(key.clone()).await? else {
-                txn.rollback().await;
-                return Ok((
-                    None,
+        || async {
+            let prepared = async {
+                let mut txn = WriteLogicalTxn::bootstrap(
+                    backend.begin_write().await?,
+                    backend.hard_limits(),
+                    budget,
+                );
+                let key = LogicalKey::BuildSchedule(id);
+                let ws_opt = txn.get(LogicalKey::BuildWorkspace(id)).await?;
+                let failed = matches!(
+                    &ws_opt,
+                    Some(PersistentValue::BuildWorkspace(w)) if w.failure.is_some()
+                );
+                let ws_reclaimed = ws_opt.is_none();
+                let is_building = match txn.get(LogicalKey::Manifest(id)).await? {
+                    Some(PersistentValue::IndexManifest(m)) => {
+                        m.lifecycle() == IndexLifecycle::Building
+                    }
+                    None => false,
+                    _ => return Err(bulk_worker::corrupt()),
+                };
+                let Some(val) = txn.get_for_update(key.clone()).await? else {
+                    txn.rollback().await;
+                    return Ok((
+                        None,
+                        FinishState {
+                            failed,
+                            needs_final_cleanup: false,
+                        },
+                    ));
+                };
+                let PersistentValue::BuildSchedule(s) = val else {
+                    return Err(bulk_worker::corrupt());
+                };
+                let slots = s.options.distributed_workers.max(1) as u32;
+                let slot_keys: Vec<LogicalKey> = (0..slots)
+                    .map(|idx| LogicalKey::BuildScheduleSlot {
+                        index: id,
+                        slot: idx,
+                    })
+                    .collect();
+                txn.warm_for_update(slot_keys).await?;
+                let skey = auth.slot_key(id);
+                match txn.get_for_update(skey.clone()).await? {
+                    Some(PersistentValue::BuildUnit(u)) if u.owner == auth.owner => {}
+                    _ => return Err(Error::new(ErrorKind::BulkBuildSuperseded)),
+                }
+
+                let (active_peers, expired_peers) = inspect_peer_slots(
+                    &mut txn,
+                    id,
+                    slots,
+                    Some((auth.slot, auth.owner)),
+                    now_ms()?,
+                )
+                .await?;
+
+                let collab = slots > 1;
+                let terminal_done = outcome.is_some() || !is_building;
+                let can_retire_self = if collab {
+                    terminal_done || failed
+                } else {
+                    (terminal_done && ws_reclaimed) || failed
+                };
+                let mut needs_final_cleanup = false;
+                if can_retire_self {
+                    txn.delete(skey).await?;
+                    if active_peers == 0 {
+                        for okey in expired_peers {
+                            txn.delete(okey).await?;
+                        }
+                        if ws_reclaimed || failed {
+                            txn.delete(key).await?;
+                        } else {
+                            needs_final_cleanup = true;
+                        }
+                    }
+                } else {
+                    let mut u = BuildUnit::unclaimed(1);
+                    u.expires_ms = expiry(delay)?;
+                    txn.put(skey, PersistentValue::BuildUnit(u)).await?;
+                }
+                Ok((
+                    Some(txn),
                     FinishState {
                         failed,
-                        needs_final_cleanup: false,
+                        needs_final_cleanup,
                     },
-                ));
-            };
-            let PersistentValue::BuildSchedule(s) = val else {
-                return Err(bulk_worker::corrupt());
-            };
-            let slots = s.options.distributed_workers.max(1) as u32;
-            let slot_keys: Vec<LogicalKey> = (0..slots)
-                .map(|idx| LogicalKey::BuildScheduleSlot {
-                    index: id,
-                    slot: idx,
-                })
-                .collect();
-            txn.warm_for_update(slot_keys).await?;
-            let skey = auth.slot_key(id);
-            match txn.get_for_update(skey.clone()).await? {
-                Some(PersistentValue::BuildUnit(u)) if u.owner == auth.owner => {}
-                _ => return Err(Error::new(ErrorKind::BulkBuildSuperseded)),
+                ))
             }
-
-            let (active_peers, expired_peers) = inspect_peer_slots(
-                &mut txn,
-                id,
-                slots,
-                Some((auth.slot, auth.owner)),
-                now_ms()?,
-            )
-            .await?;
-
-            let collab = slots > 1;
-            let terminal_done = outcome.is_some();
-            let can_retire_self = if collab {
-                terminal_done || failed
-            } else {
-                (terminal_done && ws_reclaimed) || failed
-            };
-            let mut needs_final_cleanup = false;
-            if can_retire_self {
-                txn.delete(skey).await?;
-                if active_peers == 0 {
-                    for okey in expired_peers {
-                        txn.delete(okey).await?;
-                    }
-                    if ws_reclaimed || failed {
-                        txn.delete(key).await?;
-                    } else {
-                        needs_final_cleanup = true;
-                    }
-                }
-            } else {
-                let mut u = BuildUnit::unclaimed(1);
-                u.expires_ms = expiry(delay)?;
-                txn.put(skey, PersistentValue::BuildUnit(u)).await?;
-            }
-            Ok((
-                Some(txn),
-                FinishState {
-                    failed,
-                    needs_final_cleanup,
-                },
-            ))
+            .await;
+            bulk_worker::commit_raw_prepared(prepared).await
         },
     )
     .await
